@@ -14,6 +14,8 @@ use std::{
     collections::{HashMap, HashSet},
     io::{self, stdout},
     process::Command,
+    sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -22,6 +24,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 struct Conn {
     remote: String,
+    isp: String,
     state: String,
     bytes_sent: u64,
     bytes_recv: u64,
@@ -32,17 +35,23 @@ struct Conn {
 
 struct App {
     conns: HashMap<String, Conn>,
+    isp_cache: Arc<Mutex<HashMap<String, String>>>,
+    pending_lookups: HashSet<String>,
     sort_col: usize,
+    sort_ascending: bool,
     table_state: TableState,
 }
 
-const SORT_LABELS: &[&str] = &["DOWN", "UP", "TIME", "REMOTE"];
+const SORT_LABELS: &[&str] = &["RECV", "DOWN", "UP", "TIME", "REMOTE"];
 
 impl App {
     fn new() -> Self {
         Self {
             conns: HashMap::new(),
+            isp_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_lookups: HashSet::new(),
             sort_col: 0,
+            sort_ascending: false,
             table_state: TableState::default(),
         }
     }
@@ -97,8 +106,10 @@ impl App {
                 c.bytes_recv = br;
                 c.state = state.to_string();
             } else {
+                self.spawn_isp_lookup(&remote);
                 self.conns.insert(key, Conn {
                     remote,
+                    isp: "...".into(),
                     state: state.to_string(),
                     bytes_sent: bs,
                     bytes_recv: br,
@@ -109,19 +120,68 @@ impl App {
             }
         }
         self.conns.retain(|k, _| seen.contains(k));
+
+        // Update ISP fields from cache
+        let cache = self.isp_cache.lock().unwrap();
+        for conn in self.conns.values_mut() {
+            if conn.isp == "..." {
+                let ip = conn.remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&conn.remote);
+                if let Some(isp) = cache.get(ip) {
+                    conn.isp = isp.clone();
+                }
+            }
+        }
+    }
+
+    fn spawn_isp_lookup(&mut self, remote: &str) {
+        let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote).to_string();
+        if self.pending_lookups.contains(&ip) {
+            return;
+        }
+        self.pending_lookups.insert(ip.clone());
+        let cache = Arc::clone(&self.isp_cache);
+        thread::spawn(move || {
+            let isp = run_whois(&ip);
+            cache.lock().unwrap().insert(ip, isp);
+        });
     }
 
     fn sorted_conns(&self) -> Vec<Conn> {
         let mut v: Vec<Conn> = self.conns.values().cloned().collect();
         match self.sort_col {
-            0 => v.sort_by(|a, b| b.speed_down.partial_cmp(&a.speed_down).unwrap()),
-            1 => v.sort_by(|a, b| b.speed_up.partial_cmp(&a.speed_up).unwrap()),
-            2 => v.sort_by(|a, b| b.first_seen.cmp(&a.first_seen)),
-            3 => v.sort_by(|a, b| a.remote.cmp(&b.remote)),
+            0 => v.sort_by(|a, b| b.bytes_recv.cmp(&a.bytes_recv)),
+            1 => v.sort_by(|a, b| b.speed_down.partial_cmp(&a.speed_down).unwrap()),
+            2 => v.sort_by(|a, b| b.speed_up.partial_cmp(&a.speed_up).unwrap()),
+            3 => v.sort_by(|a, b| b.first_seen.cmp(&a.first_seen)),
+            4 => v.sort_by(|a, b| a.remote.cmp(&b.remote)),
             _ => {}
+        }
+        if self.sort_ascending {
+            v.reverse();
         }
         v
     }
+}
+
+fn run_whois(ip: &str) -> String {
+    let output = Command::new("whois").arg(ip).output();
+    let output = match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return "?".into(),
+    };
+    // Try common whois fields for org/ISP name
+    for prefix in ["OrgName:", "org-name:", "netname:", "descr:", "Organization:"] {
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let name = rest.trim();
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    "?".into()
 }
 
 fn extract_field(s: &str, field: &str) -> u64 {
@@ -213,7 +273,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     // Title bar
-    let sort_str = format!(" Sort: {} (Tab) ", SORT_LABELS[app.sort_col]);
+    let dir = if app.sort_ascending { "ASC" } else { "DESC" };
+    let sort_str = format!(" {} {} (Tab/s) ", SORT_LABELS[app.sort_col], dir);
+    let sort_color = if app.sort_ascending { Color::Yellow } else { Color::Blue };
     let count_str = format!(" {} connections ", count);
     let pad_len = (area.width as usize)
         .saturating_sub(10 + count_str.len() + sort_str.len());
@@ -224,26 +286,34 @@ fn draw(f: &mut Frame, app: &mut App) {
         ),
         Span::styled(&count_str, Style::default().fg(Color::Yellow)),
         Span::raw(" ".repeat(pad_len)),
-        Span::styled(&sort_str, Style::default().fg(Color::Green)),
+        Span::styled(&sort_str, Style::default().fg(sort_color)),
     ]);
     f.render_widget(title, chunks[0]);
 
     // Table
-    let header = Row::new([
-        "REMOTE", "DOWN", "UP", "SENT", "RECV", "CONNECTED",
-    ])
-    .style(
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .fg(Color::Black)
-            .bg(Color::White),
-    );
+    let base_hdr = Style::default().add_modifier(Modifier::BOLD).fg(Color::Black).bg(Color::White);
+    // Column-to-sort-index: REMOTE_IP=4, ISP=none, DOWN=1, UP=2, SENT=none, RECV=0, CONNECTED=3
+    let col_sort: [Option<usize>; 7] = [Some(4), None, Some(1), Some(2), None, Some(0), Some(3)];
+    let header_labels = ["REMOTE_IP", "ISP", "DOWN", "UP", "SENT", "RECV", "CONNECTED"];
+    let header = Row::new(
+        header_labels.iter().enumerate().map(|(i, label)| {
+            if col_sort[i] == Some(app.sort_col) {
+                Cell::from(Line::from(Span::styled(
+                    *label,
+                    Style::default().add_modifier(Modifier::BOLD).fg(sort_color),
+                )))
+            } else {
+                Cell::from(*label)
+            }
+        }).collect::<Vec<_>>()
+    ).style(base_hdr);
 
     let rows: Vec<Row> = sorted
         .iter()
         .map(|c| {
             Row::new([
                 Cell::from(c.remote.clone()),
+                Cell::from(c.isp.clone()),
                 Cell::from(fmt_speed(c.speed_down)),
                 Cell::from(fmt_speed(c.speed_up)),
                 Cell::from(fmt_bytes(c.bytes_sent)),
@@ -255,7 +325,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Min(20),
+        Constraint::Min(16),
+        Constraint::Min(14),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(7),
@@ -272,7 +343,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Footer
     let footer = Line::from(Span::styled(
-        " q:Quit  Tab:Sort  j/k/↑/↓:Scroll  PgUp/PgDn ",
+        " q:Quit  Tab:Sort  s:Asc/Desc  j/k/↑/↓:Scroll  PgUp/PgDn ",
         Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
@@ -305,7 +376,8 @@ fn main() -> io::Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Tab => app.sort_col = (app.sort_col + 1) % 4,
+                    KeyCode::Tab => app.sort_col = (app.sort_col + 1) % 5,
+                    KeyCode::Char('s') => app.sort_ascending = !app.sort_ascending,
                     KeyCode::Char('j') | KeyCode::Down => app.table_state.scroll_down_by(1),
                     KeyCode::Char('k') | KeyCode::Up => app.table_state.scroll_up_by(1),
                     KeyCode::PageDown => app.table_state.scroll_down_by(10),
