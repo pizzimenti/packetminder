@@ -21,7 +21,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Conn {
-    local: String,
     remote: String,
     state: String,
     bytes_sent: u64,
@@ -72,7 +71,7 @@ impl App {
                 i += 1;
                 continue;
             }
-            let local = parts[3].to_string();
+            let local = parts[3];
             let remote = parts[4].to_string();
 
             let mut info = String::new();
@@ -99,7 +98,6 @@ impl App {
                 c.state = state.to_string();
             } else {
                 self.conns.insert(key, Conn {
-                    local,
                     remote,
                     state: state.to_string(),
                     bytes_sent: bs,
@@ -232,7 +230,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Table
     let header = Row::new([
-        "STATE", "LOCAL", "REMOTE", "DOWN", "UP", "SENT", "RECV", "CONNECTED",
+        "REMOTE", "DOWN", "UP", "SENT", "RECV", "CONNECTED",
     ])
     .style(
         Style::default()
@@ -245,8 +243,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         .iter()
         .map(|c| {
             Row::new([
-                Cell::from(c.state.clone()),
-                Cell::from(c.local.clone()),
                 Cell::from(c.remote.clone()),
                 Cell::from(fmt_speed(c.speed_down)),
                 Cell::from(fmt_speed(c.speed_up)),
@@ -259,9 +255,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .collect();
 
     let widths = [
-        Constraint::Length(11),
-        Constraint::Min(16),
-        Constraint::Min(16),
+        Constraint::Min(20),
         Constraint::Length(10),
         Constraint::Length(10),
         Constraint::Length(7),
