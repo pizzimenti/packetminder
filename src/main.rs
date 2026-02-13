@@ -33,16 +33,18 @@ struct Conn {
     first_seen: SystemTime,
 }
 
+// Columns: 0=REMOTE_IP, 1=ISP, 2=DOWN, 3=UP, 4=SENT, 5=RECV, 6=CONNECTED
+const COL_COUNT: usize = 7;
+const COL_LABELS: &[&str] = &["REMOTE_IP", "ISP", "DOWN", "UP", "SENT", "RECV", "CONNECTED"];
+const DEFAULT_SORT_COL: usize = 5; // RECV
+
 struct App {
     conns: HashMap<String, Conn>,
     isp_cache: Arc<Mutex<HashMap<String, String>>>,
     pending_lookups: HashSet<String>,
     sort_col: usize,
-    sort_ascending: bool,
     table_state: TableState,
 }
-
-const SORT_LABELS: &[&str] = &["RECV", "DOWN", "UP", "TIME", "REMOTE"];
 
 impl App {
     fn new() -> Self {
@@ -50,8 +52,7 @@ impl App {
             conns: HashMap::new(),
             isp_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_lookups: HashSet::new(),
-            sort_col: 0,
-            sort_ascending: false,
+            sort_col: DEFAULT_SORT_COL,
             table_state: TableState::default(),
         }
     }
@@ -149,15 +150,14 @@ impl App {
     fn sorted_conns(&self) -> Vec<Conn> {
         let mut v: Vec<Conn> = self.conns.values().cloned().collect();
         match self.sort_col {
-            0 => v.sort_by(|a, b| b.bytes_recv.cmp(&a.bytes_recv)),
-            1 => v.sort_by(|a, b| b.speed_down.partial_cmp(&a.speed_down).unwrap()),
-            2 => v.sort_by(|a, b| b.speed_up.partial_cmp(&a.speed_up).unwrap()),
-            3 => v.sort_by(|a, b| b.first_seen.cmp(&a.first_seen)),
-            4 => v.sort_by(|a, b| a.remote.cmp(&b.remote)),
+            0 => v.sort_by(|a, b| parse_ip_sort_key(&a.remote).cmp(&parse_ip_sort_key(&b.remote))),
+            1 => v.sort_by(|a, b| a.isp.to_lowercase().cmp(&b.isp.to_lowercase())),
+            2 => v.sort_by(|a, b| b.speed_down.partial_cmp(&a.speed_down).unwrap()),
+            3 => v.sort_by(|a, b| b.speed_up.partial_cmp(&a.speed_up).unwrap()),
+            4 => v.sort_by(|a, b| b.bytes_sent.cmp(&a.bytes_sent)),
+            5 => v.sort_by(|a, b| b.bytes_recv.cmp(&a.bytes_recv)),
+            6 => v.sort_by(|a, b| a.first_seen.cmp(&b.first_seen)),
             _ => {}
-        }
-        if self.sort_ascending {
-            v.reverse();
         }
         v
     }
@@ -182,6 +182,16 @@ fn run_whois(ip: &str) -> String {
         }
     }
     "?".into()
+}
+
+fn parse_ip_sort_key(remote: &str) -> u32 {
+    let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote);
+    let parts: Vec<u32> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
+    if parts.len() == 4 {
+        (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+    } else {
+        0
+    }
 }
 
 fn extract_field(s: &str, field: &str) -> u64 {
@@ -273,40 +283,27 @@ fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     // Title bar
-    let dir = if app.sort_ascending { "ASC" } else { "DESC" };
-    let sort_str = format!(" {} {} (Tab/s) ", SORT_LABELS[app.sort_col], dir);
-    let sort_color = if app.sort_ascending { Color::Yellow } else { Color::Blue };
+    let sort_color = Color::Rgb(255, 105, 180);
     let count_str = format!(" {} connections ", count);
-    let pad_len = (area.width as usize)
-        .saturating_sub(10 + count_str.len() + sort_str.len());
     let title = Line::from(vec![
         Span::styled(
             " NETWATCH ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(&count_str, Style::default().fg(Color::Yellow)),
-        Span::raw(" ".repeat(pad_len)),
-        Span::styled(&sort_str, Style::default().fg(sort_color)),
     ]);
     f.render_widget(title, chunks[0]);
 
     // Table
-    let base_hdr = Style::default().add_modifier(Modifier::BOLD).fg(Color::Black).bg(Color::White);
-    // Column-to-sort-index: REMOTE_IP=4, ISP=none, DOWN=1, UP=2, SENT=none, RECV=0, CONNECTED=3
-    let col_sort: [Option<usize>; 7] = [Some(4), None, Some(1), Some(2), None, Some(0), Some(3)];
-    let header_labels = ["REMOTE_IP", "ISP", "DOWN", "UP", "SENT", "RECV", "CONNECTED"];
+    let hdr_bg = Color::Rgb(40, 40, 40);
+    let base_hdr = Style::default().add_modifier(Modifier::BOLD).fg(Color::White).bg(hdr_bg);
+    let active_hdr = Style::default().add_modifier(Modifier::BOLD).fg(sort_color).bg(hdr_bg);
     let header = Row::new(
-        header_labels.iter().enumerate().map(|(i, label)| {
-            if col_sort[i] == Some(app.sort_col) {
-                Cell::from(Line::from(Span::styled(
-                    *label,
-                    Style::default().add_modifier(Modifier::BOLD).fg(sort_color),
-                )))
-            } else {
-                Cell::from(*label)
-            }
+        COL_LABELS.iter().enumerate().map(|(i, label)| {
+            let style = if i == app.sort_col { active_hdr } else { base_hdr };
+            Cell::from(Line::styled(*label, style))
         }).collect::<Vec<_>>()
-    ).style(base_hdr);
+    );
 
     let rows: Vec<Row> = sorted
         .iter()
@@ -343,7 +340,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Footer
     let footer = Line::from(Span::styled(
-        " q:Quit  Tab:Sort  s:Asc/Desc  j/k/↑/↓:Scroll  PgUp/PgDn ",
+        " q:Quit  Tab:Sort  j/k/↑/↓:Scroll  PgUp/PgDn ",
         Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
@@ -376,8 +373,7 @@ fn main() -> io::Result<()> {
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Tab => app.sort_col = (app.sort_col + 1) % 5,
-                    KeyCode::Char('s') => app.sort_ascending = !app.sort_ascending,
+                    KeyCode::Tab => app.sort_col = (app.sort_col + 1) % COL_COUNT,
                     KeyCode::Char('j') | KeyCode::Down => app.table_state.scroll_down_by(1),
                     KeyCode::Char('k') | KeyCode::Up => app.table_state.scroll_up_by(1),
                     KeyCode::PageDown => app.table_state.scroll_down_by(10),
