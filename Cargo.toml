@@ -2,5 +2,6 @@
 members = [
     "crates/netwatch-core",
     "crates/netwatch-tui",
+    "crates/netwatch-alertd",
 ]
 resolver = "3"

@@ -1,0 +1,14 @@
+[package]
+name = "netwatch-alertd"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "netwatch-alertd"
+path = "src/main.rs"
+
+# Intentionally dependency-free. This runs as a long-lived user service, so the
+# smaller its supply chain the better. It also cannot link netwatch-core, which
+# is built with pyo3's `extension-module` feature and therefore leaves the
+# libpython symbols undefined — fine for a cdylib, a link error for a binary.
+[dependencies]

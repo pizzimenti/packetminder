@@ -1,0 +1,33 @@
+[Unit]
+Description=netwatch-alertd — detect inbound traffic nothing is consuming
+Documentation=file:%h/Code/netwatch/crates/netwatch-alertd/README.md
+Wants=network.target
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/netwatch-alertd
+Restart=on-failure
+RestartSec=10s
+
+# StateDirectory creates and owns %S/netwatch, which is where the event log
+# lives. Pointing log_path outside it means relaxing ProtectHome below.
+StateDirectory=netwatch
+
+# The daemon reads /proc/net/*, tails the journal, and shells out to
+# notify-send, getent, ip and whois. It never needs to write outside its state
+# directory and never needs elevated privileges.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target
