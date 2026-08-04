@@ -52,18 +52,18 @@ pub fn log(cfg: &Config, message: &str) {
     if let Some(parent) = cfg.log_path.parent()
         && let Err(e) = fs::create_dir_all(parent)
     {
-        eprintln!("netwatch-alertd: cannot create {}: {e}", parent.display());
+        eprintln!("netwatch: cannot create {}: {e}", parent.display());
         return;
     }
 
     match OpenOptions::new().create(true).append(true).open(&cfg.log_path) {
         Ok(mut fh) => {
             if let Err(e) = fh.write_all(line.as_bytes()) {
-                eprintln!("netwatch-alertd: cannot write log: {e}");
+                eprintln!("netwatch: cannot write log: {e}");
             }
         }
         Err(e) => eprintln!(
-            "netwatch-alertd: cannot open {}: {e}",
+            "netwatch: cannot open {}: {e}",
             cfg.log_path.display()
         ),
     }
@@ -91,7 +91,7 @@ fn notify(alert: &Alert) {
         .status();
 
     if let Err(e) = result {
-        eprintln!("netwatch-alertd: notify-send failed: {e}");
+        eprintln!("netwatch: notify-send failed: {e}");
     }
 }
 

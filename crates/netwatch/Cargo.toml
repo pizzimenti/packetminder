@@ -1,10 +1,10 @@
 [package]
-name = "netwatch-alertd"
+name = "netwatch"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "netwatch-alertd"
+name = "netwatch"
 path = "src/main.rs"
 
 # Intentionally dependency-free. This runs as a long-lived user service, so the

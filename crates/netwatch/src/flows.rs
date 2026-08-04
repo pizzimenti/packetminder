@@ -145,7 +145,7 @@ pub fn spawn_follower(pattern: &str) -> Receiver<BlockEvent> {
                     }
                     let _ = proc.wait();
                 }
-                Err(e) => eprintln!("netwatch-alertd: cannot run journalctl: {e}"),
+                Err(e) => eprintln!("netwatch: cannot run journalctl: {e}"),
             }
 
             // journalctl exited. Back off before retrying so a persistent

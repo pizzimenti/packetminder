@@ -1,12 +1,12 @@
 [Unit]
-Description=netwatch-alertd — detect inbound traffic nothing is consuming
-Documentation=file:%h/Code/netwatch/crates/netwatch-alertd/README.md
+Description=netwatch — detect inbound traffic nothing is consuming
+Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
 Wants=network.target
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/netwatch-alertd
+ExecStart=%h/.local/bin/netwatch
 Restart=on-failure
 RestartSec=10s
 

@@ -1,5 +1,5 @@
 // =============================================================================
-// netwatch-alertd — background detector for inbound traffic nothing consumes.
+// netwatch — background detector for inbound traffic nothing consumes.
 //
 // netwatch's TUI and GUI answer "what are my connections doing?" by polling
 // `ss`. That is connection-oriented by construction, so it is blind to traffic
@@ -47,7 +47,7 @@ fn main() {
         Some("--selftest") => selftest(cfg),
         Some("--help" | "-h") => usage(),
         Some(other) => {
-            eprintln!("netwatch-alertd: unknown argument `{other}`");
+            eprintln!("netwatch: unknown argument `{other}`");
             usage();
             std::process::exit(2);
         }
@@ -56,7 +56,7 @@ fn main() {
 
 fn usage() {
     println!(
-        "Usage: netwatch-alertd [option]
+        "Usage: netwatch [option]
 
 Run with no arguments to start monitoring (this is what the service does).
 
@@ -305,7 +305,7 @@ fn selftest(cfg: Config) {
     let a = Alert {
         kind: "selftest",
         key: "selftest".to_string(),
-        title: "netwatch-alertd selftest".to_string(),
+        title: "netwatch selftest".to_string(),
         body: "If you can read this, notifications and the event log both work."
             .to_string(),
         urgency: "normal",

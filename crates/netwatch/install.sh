@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build netwatch-alertd and install it as a systemd user service.
+# Build netwatch and install it as a systemd user service.
 #
 # Safe to re-run: it rebuilds, reinstalls, and restarts, which is how you pick
 # up code or unit changes.
@@ -12,25 +12,25 @@ repo_dir="$(cd "$crate_dir/../.." && pwd)"
 bin_dir="$HOME/.local/bin"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/netwatch"
-unit_name="netwatch-alertd.service"
+unit_name="netwatch.service"
 
 echo "==> Building (release)"
-cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p netwatch-alertd
+cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p netwatch
 
 echo "==> Installing binary to $bin_dir"
-install -Dm755 "$repo_dir/target/release/netwatch-alertd" "$bin_dir/netwatch-alertd"
+install -Dm755 "$repo_dir/target/release/netwatch" "$bin_dir/netwatch"
 
 echo "==> Installing unit to $unit_dir"
 install -Dm644 "$crate_dir/$unit_name" "$unit_dir/$unit_name"
 
 # Never clobber a config the user has tuned.
-if [[ ! -f "$config_dir/alertd.conf" ]]; then
-    echo "==> Writing default config to $config_dir/alertd.conf"
+if [[ ! -f "$config_dir/netwatch.conf" ]]; then
+    echo "==> Writing default config to $config_dir/netwatch.conf"
     install -d "$config_dir"
-    cat >"$config_dir/alertd.conf" <<'EOF'
-# netwatch-alertd configuration. Every key is optional.
+    cat >"$config_dir/netwatch.conf" <<'EOF'
+# netwatch configuration. Every key is optional.
 # Re-read at start only: restart the service after editing.
-#   systemctl --user restart netwatch-alertd
+#   systemctl --user restart netwatch
 
 # -- Sampling --
 # interval_secs = 10
@@ -78,7 +78,7 @@ if [[ ! -f "$config_dir/alertd.conf" ]]; then
 # notify = true
 EOF
 else
-    echo "==> Keeping existing config at $config_dir/alertd.conf"
+    echo "==> Keeping existing config at $config_dir/netwatch.conf"
 fi
 
 echo "==> Verifying unit"
@@ -94,8 +94,8 @@ echo
 systemctl --user --no-pager --lines=0 status "$unit_name" || true
 echo
 echo "Installed. Useful commands:"
-echo "  systemctl --user status netwatch-alertd"
-echo "  journalctl --user -u netwatch-alertd -f"
-echo "  netwatch-alertd --status          # one interface sample"
-echo "  netwatch-alertd --replay -24h     # what would have alerted"
-echo "  netwatch-alertd --selftest        # prove notifications work"
+echo "  systemctl --user status netwatch"
+echo "  journalctl --user -u netwatch -f"
+echo "  netwatch --status          # one interface sample"
+echo "  netwatch --replay -24h     # what would have alerted"
+echo "  netwatch --selftest        # prove notifications work"

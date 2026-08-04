@@ -1,8 +1,8 @@
 // =============================================================================
 // config — tunables, loaded from a plain `key = value` file.
 //
-// Config lives at $XDG_CONFIG_HOME/netwatch/alertd.conf (default
-// ~/.config/netwatch/alertd.conf). Every key is optional; anything missing
+// Config lives at $XDG_CONFIG_HOME/netwatch/netwatch.conf (default
+// ~/.config/netwatch/netwatch.conf). Every key is optional; anything missing
 // falls back to the defaults below. Unknown keys are reported but ignored so a
 // stale config never stops the service from starting.
 // =============================================================================
@@ -104,7 +104,7 @@ impl Default for Config {
 
             cooldown_secs: 1800,
             notify: true,
-            log_path: state_dir().join("alertd.log"),
+            log_path: state_dir().join("netwatch.log"),
         }
     }
 }
@@ -246,7 +246,7 @@ pub fn config_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
         .join("netwatch")
-        .join("alertd.conf")
+        .join("netwatch.conf")
 }
 
 pub fn state_dir() -> PathBuf {

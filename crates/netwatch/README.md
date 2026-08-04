@@ -1,4 +1,4 @@
-# netwatch-alertd
+# netwatch
 
 A background service that notices inbound traffic **nothing on this host is
 consuming**, and raises a desktop notification naming the source.
@@ -186,10 +186,10 @@ and writes a commented default config on first run only. Safe to re-run.
 ## Use
 
 ```sh
-netwatch-alertd --status          # one interface sample, with rates
-netwatch-alertd --replay -24h     # what would have alerted over past history
-netwatch-alertd --selftest        # prove the notification path works
-journalctl --user -u netwatch-alertd -f
+netwatch --status          # one interface sample, with rates
+netwatch --replay -24h     # what would have alerted over past history
+netwatch --selftest        # prove the notification path works
+journalctl --user -u netwatch -f
 ```
 
 `--replay` is the honest way to tune thresholds. It re-runs the blocked-flow
@@ -203,7 +203,7 @@ log records. Counts indicate persistence, not volume.
 
 ## Config
 
-`~/.config/netwatch/alertd.conf`, plain `key = value`, all keys optional. Read
+`~/.config/netwatch/netwatch.conf`, plain `key = value`, all keys optional. Read
 at startup only; restart the service after editing.
 
 Defaults: 1 Mbps inbound floor, 5% asymmetry ratio held for 60s, 4 drop records
