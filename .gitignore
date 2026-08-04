@@ -1,1 +1,6 @@
 /target
+
+# Python bytecode, regenerated on every run. Applies to the qt/ app and to
+# anything importing netwatch-core's pyo3 module.
+__pycache__/
+*.pyc
