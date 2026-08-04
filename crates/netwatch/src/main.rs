@@ -23,6 +23,7 @@ mod flows;
 mod iface;
 mod local;
 mod proto;
+mod role;
 mod selfblock;
 
 use std::{
@@ -87,6 +88,9 @@ const IPV6_CHECK_SECS: i64 = 60;
 
 fn run(cfg: Config) {
     alert::log(&format!("started — {}", cfg.summary()));
+    // What this host *is* determines how its traffic should be read, so record
+    // it once at startup. Changes are picked up per tick, not from this line.
+    alert::log(&format!("role — {}", role::describe()));
 
     let events = flows::spawn_follower(&cfg.block_pattern);
     let mut asym = AsymDetector::new();
@@ -292,7 +296,12 @@ fn status(cfg: Config) {
     thread::sleep(Duration::from_secs(cfg.interval_secs.clamp(2, 5)));
     detector.tick(&cfg, None);
 
-    println!("{}\n", cfg.summary());
+    println!("{}", cfg.summary());
+    println!("role: {}\n", role::describe());
+
+    let routing = role::is_forwarding();
+    let host_tx_bps: f64 = detector.rates.values().map(|r| r.tx_bps).sum();
+
     let mut names: Vec<&String> = detector.rates.keys().collect();
     names.sort();
 
@@ -303,7 +312,10 @@ fn status(cfg: Config) {
         } else {
             0.0
         };
-        let flag = if r.rx_bps >= cfg.rx_floor_bps && r.tx_bps < r.rx_bps * cfg.asym_ratio {
+        // Mirror the detector exactly, forwarding included, or --status would
+        // disagree with the alerts it exists to explain.
+        let answering = if routing { host_tx_bps } else { r.tx_bps };
+        let flag = if r.rx_bps >= cfg.rx_floor_bps && answering < r.rx_bps * cfg.asym_ratio {
             "  <-- one-sided"
         } else {
             ""

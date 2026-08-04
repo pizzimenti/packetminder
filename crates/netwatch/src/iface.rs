@@ -21,6 +21,7 @@ use std::{
 use crate::{
     alert::{Alert, fmt_bits, fmt_duration},
     config::Config,
+    role,
 };
 
 // -- Data Structures ----------------------------------------------------------
@@ -100,8 +101,11 @@ impl AsymDetector {
 
         let current = read_dev();
         let mut alerts = Vec::new();
-        self.rates.clear();
 
+        // First pass: a rate for every interface being watched. Judgement has
+        // to wait until all of them are known, because when this host forwards,
+        // the denominator is the whole host rather than one interface.
+        let mut sampled: Vec<(String, Rates)> = Vec::new();
         for (name, counters) in &current {
             if cfg.ignore_interfaces.iter().any(|i| i == name) {
                 continue;
@@ -115,9 +119,24 @@ impl AsymDetector {
             // spike large enough to alert on.
             let rx_bps = counters.rx.saturating_sub(previous.rx) as f64 * 8.0 / elapsed;
             let tx_bps = counters.tx.saturating_sub(previous.tx) as f64 * 8.0 / elapsed;
-            self.rates.insert(name.clone(), Rates { rx_bps, tx_bps });
+            sampled.push((name.clone(), Rates { rx_bps, tx_bps }));
+        }
 
-            let one_sided = rx_bps >= cfg.rx_floor_bps && tx_bps < rx_bps * cfg.asym_ratio;
+        // Re-read every tick rather than caching: turning on a hotspot or
+        // connection sharing flips forwarding underneath a running daemon, and
+        // nothing announces it.
+        let routing = role::is_forwarding();
+        let host_tx_bps: f64 = sampled.iter().map(|(_, r)| r.tx_bps).sum();
+
+        for (name, rates) in &sampled {
+            // A router receives on one interface and answers on another, so
+            // per-interface rx-without-tx is what a *working* router looks
+            // like. Judging each interface alone would report a healthy hotspot
+            // as a flood on both of its interfaces at once. Whether this host
+            // answered at all is still a fair question — just at host scope.
+            let answering_bps = if routing { host_tx_bps } else { rates.tx_bps };
+            let one_sided =
+                rates.rx_bps >= cfg.rx_floor_bps && answering_bps < rates.rx_bps * cfg.asym_ratio;
             if !one_sided {
                 self.since.remove(name);
                 continue;
@@ -137,9 +156,17 @@ impl AsymDetector {
             }
 
             self.alerted.insert(name.clone(), now);
-            alerts.push(build_alert(name, rx_bps, tx_bps, held.as_secs(), hint.as_deref()));
+            alerts.push(build_alert(
+                name,
+                rates.rx_bps,
+                rates.tx_bps,
+                held.as_secs(),
+                hint.as_deref(),
+                routing,
+            ));
         }
 
+        self.rates = sampled.into_iter().collect();
         self.last = current;
         self.last_at = now;
         alerts
@@ -152,6 +179,7 @@ fn build_alert(
     tx_bps: f64,
     held_secs: u64,
     hint: Option<&str>,
+    routing: bool,
 ) -> Alert {
     let ratio = if rx_bps > 0.0 {
         tx_bps / rx_bps * 100.0
@@ -160,22 +188,36 @@ fn build_alert(
     };
 
     let body = format!(
-        "Receiving {}, sending only {} ({:.1}%) for {}.\n\
-         Nothing on this host appears to be answering it.",
+        "Receiving {}, sending only {} ({:.1}%) for {}.\n{}",
         fmt_bits(rx_bps),
         fmt_bits(tx_bps),
         ratio,
         fmt_duration(held_secs),
+        if routing {
+            // The reader needs to know the judgement was made at host scope,
+            // or the per-interface numbers above will not add up for them.
+            "This host is forwarding, and no interface is passing it on."
+        } else {
+            "Nothing on this host appears to be answering it."
+        },
     );
 
     // Drops that happen to overlap this window are evidence, not a cause. A
     // handful of dropped UDP packets cannot account for megabits per second,
     // and putting the two side by side in a popup invites exactly that reading.
     // Say "concurrent" and keep it out of the two lines a human actually reads.
-    let detail = match hint {
+    let mut detail = match hint {
         Some(h) => format!("Concurrent firewall drops, which may be unrelated: {h}"),
         None => format!("To identify it: sudo tcpdump -i {iface} -nn -c 200"),
     };
+    if routing {
+        detail.push_str(&format!(
+            " Judged against this host's total output rather than {iface}'s alone, \
+             because forwarding is enabled ({}) — a router answering on a different \
+             interface than it received on is behaving correctly.",
+            role::forwarding_ifaces().join(", ")
+        ));
+    }
 
     Alert {
         kind: "asymmetric-inbound",
