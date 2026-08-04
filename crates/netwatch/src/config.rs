@@ -97,9 +97,17 @@ impl Default for Config {
             // 1 Mbps floor: below this, even a fully one-sided flow is not
             // worth waking somebody up for.
             rx_floor_bps: 1_000_000.0,
-            // A real download ACKs at roughly 2-10% of the inbound rate. Under
-            // 5% means this host is not participating in what it is receiving.
-            asym_ratio: 0.05,
+            // Bulk TCP with delayed ACKs sends roughly one 66-byte ack per two
+            // 1514-byte frames, so a healthy download runs about 2.2% outbound.
+            // 5% sat above that and caught ordinary downloads; 2% sits just
+            // below it.
+            //
+            // This narrows the overlap rather than removing it. A download can
+            // dip under 2% with large-receive-offload, and a real one-sided
+            // flood can carry a little back-chatter. A ratio alone cannot
+            // separate them -- that needs corroboration from whether a socket
+            // actually accounts for the volume.
+            asym_ratio: 0.02,
             asym_sustain_secs: 60,
             // tailscale0 carries the same bytes as its underlay interface, so
             // counting it too would double-report every event.

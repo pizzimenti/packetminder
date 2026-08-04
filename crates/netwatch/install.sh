@@ -38,8 +38,10 @@ if [[ ! -f "$config_dir/netwatch.conf" ]]; then
 # -- Asymmetry detector --
 # Inbound traffic this fast (bits/sec) with almost no outbound means this host
 # is receiving something it is not part of.
+# Bulk TCP acks at roughly 2.2% of the inbound rate, so this sits just below
+# that. Raising it above ~0.03 will alert on ordinary large downloads.
 # rx_floor_bps = 1000000
-# asym_ratio = 0.05
+# asym_ratio = 0.02
 # asym_sustain_secs = 60
 # ignore_interfaces = lo, tailscale0
 

@@ -30,7 +30,7 @@ Detectors, deliberately at different layers than the TUI:
 
 | Detector | Source | Catches |
 | --- | --- | --- |
-| `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Under 5% outbound means this host is not part of the conversation. |
+| `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Bulk TCP runs ~2.2% outbound, so under 2% means this host is probably not part of the conversation. See the caveat below. |
 | `blocked-flow` | kernel log, `[UFW BLOCK]` records | One source being dropped repeatedly for minutes, grouped by (source, protocol, destination port). Names the culprit exactly, and reports whether anything is actually listening on that port. |
 | `self-blocked` | the records `blocked-flow` rejects | Traffic *this host* sends that its own firewall drops. Not an attack, but not nothing — see below. |
 | `udp-no-listener` | `Udp.NoPorts`, `/proc/net/snmp` | Datagrams the kernel delivered to a port with no socket. The premise of this daemon, counted at the source — and unlike the drop log it covers traffic the firewall *allows* through to a dead port. |
@@ -209,8 +209,22 @@ log records. Counts indicate persistence, not volume.
 `~/.config/netwatch/netwatch.conf`, plain `key = value`, all keys optional. Read
 at startup only; restart the service after editing.
 
-Defaults: 1 Mbps inbound floor, 5% asymmetry ratio held for 60s, 4 drop records
+Defaults: 1 Mbps inbound floor, 2% asymmetry ratio held for 60s, 4 drop records
 spanning 2 minutes, 30-minute cooldown per subject, no ignored ports.
+
+### The asymmetry ratio cannot be exact
+
+Bulk TCP with delayed ACKs sends about one 66-byte ack per two 1514-byte
+frames, so a healthy download already runs near 2.2% outbound. The original 5%
+default therefore fired on ordinary large downloads: an observed alert here
+reported 35.21 Mbps at 1.8%, which is what a fast download looks like, not an
+attack.
+
+2% sits just below the ACK floor, which narrows the overlap without closing it.
+Large-receive-offload can push a real download under 2%, and a genuinely
+one-sided flood can carry a little back-chatter. Separating them properly means
+asking whether an established socket accounts for the volume, rather than
+tuning a ratio.
 
 `ignore_ports` takes a comma-separated list and is parsed all-or-nothing — a
 typo in one entry keeps the default rather than silently widening the blind
