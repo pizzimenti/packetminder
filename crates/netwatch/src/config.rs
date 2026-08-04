@@ -7,7 +7,7 @@
 // stale config never stops the service from starting.
 // =============================================================================
 
-use std::{env, fs, path::PathBuf};
+use std::{collections::HashMap, env, fs, path::PathBuf};
 
 // -- Data Structures ----------------------------------------------------------
 
@@ -53,6 +53,27 @@ pub struct Config {
     /// so it needs only enough records to rule out a one-off.
     pub self_unicast_min_events: u64,
 
+    // -- Protocol counters --
+    /// Watch /proc/net/snmp and /proc/net/netstat.
+    pub watch_proto: bool,
+    /// Datagrams per second delivered to a port with no socket, above which
+    /// something is persistently talking to a port nothing serves.
+    pub noports_min_rate: f64,
+    /// Packets per second discarded because a receive queue was full. This one
+    /// is about a local program falling behind, not about an unwanted sender.
+    pub rcvbuf_min_rate: f64,
+    /// How long either rate must hold before alerting, in seconds.
+    pub proto_sustain_secs: u64,
+
+    // -- Device names --
+    /// Names you chose, keyed by lowercase MAC or by address.
+    ///
+    /// Consulted before any lookup, because it is the only source that knows
+    /// which of two identical devices this is. An OUI gives the type -- two
+    /// travel routers from the same maker are both "GL" -- and mDNS gives
+    /// whatever the vendor's firmware felt like publishing.
+    pub names: HashMap<String, String>,
+
     // -- IPv6 watch --
     /// Report when IPv6 addressing becomes active where there was none.
     ///
@@ -97,6 +118,18 @@ impl Default for Config {
             self_window_secs: 3600,
             self_min_active_minutes: 30,
             self_unicast_min_events: 4,
+
+            watch_proto: true,
+            // A handful of stray datagrams a second is ordinary on any LAN with
+            // discovery protocols on it. Five a second, held for a minute, is
+            // something actually pointed at this host.
+            noports_min_rate: 5.0,
+            // Receive-buffer loss is rarer and means more when it happens, but
+            // a brief burst during a spike is normal, so it still has to hold.
+            rcvbuf_min_rate: 10.0,
+            proto_sustain_secs: 60,
+
+            names: HashMap::new(),
 
             watch_ipv6: true,
 
@@ -171,6 +204,25 @@ impl Config {
                     cfg.watch_ipv6 = matches!(value, "1" | "true" | "yes" | "on");
                     true
                 }
+                "watch_proto" => {
+                    cfg.watch_proto = matches!(value, "1" | "true" | "yes" | "on");
+                    true
+                }
+                "noports_min_rate" => set_f64(&mut cfg.noports_min_rate, value),
+                "rcvbuf_min_rate" => set_f64(&mut cfg.rcvbuf_min_rate, value),
+                "proto_sustain_secs" => set_u64(&mut cfg.proto_sustain_secs, value),
+                // `name <mac|ip> = <label>`, repeatable. A MAC survives a DHCP
+                // reshuffle; an address is there for devices that never appear
+                // in the neighbour table.
+                k if k.starts_with("name ") => {
+                    let subject = k["name ".len()..].trim().to_lowercase();
+                    if subject.is_empty() || value.is_empty() {
+                        false
+                    } else {
+                        cfg.names.insert(subject, value.to_string());
+                        true
+                    }
+                }
                 "cooldown_secs" => set_u64(&mut cfg.cooldown_secs, value),
                 "notify" => {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");
@@ -210,10 +262,20 @@ impl Config {
                 .join(",")
         };
 
+        let proto = if self.watch_proto {
+            format!(
+                "noports_min_rate={:.0}/s rcvbuf_min_rate={:.0}/s proto_sustain={}s",
+                self.noports_min_rate, self.rcvbuf_min_rate, self.proto_sustain_secs,
+            )
+        } else {
+            "proto=off".to_string()
+        };
+
         format!(
             "interval={}s rx_floor={:.1}Mbps asym_ratio={:.0}% sustain={}s \
              block_min_events={} block_min_span={}s ignore_ports={ignored} \
-             self_window={}s self_min_active_minutes={} cooldown={}s notify={}",
+             self_window={}s self_min_active_minutes={} {proto} named_devices={} \
+             cooldown={}s notify={}",
             self.interval_secs,
             self.rx_floor_bps / 1_000_000.0,
             self.asym_ratio * 100.0,
@@ -222,6 +284,7 @@ impl Config {
             self.block_min_span_secs,
             self.self_window_secs,
             self.self_min_active_minutes,
+            self.names.len(),
             self.cooldown_secs,
             self.notify,
         )

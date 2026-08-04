@@ -73,6 +73,33 @@ if [[ ! -f "$config_dir/netwatch.conf" ]]; then
 # it came back, or expect it and want to know when it arrived.
 # watch_ipv6 = true
 
+# -- Protocol counters --
+# Watches /proc/net/snmp and /proc/net/netstat, which see two things the other
+# detectors cannot: datagrams the firewall ALLOWS through to a port with no
+# socket, and traffic this host wanted but could not drain fast enough.
+# watch_proto = true
+#
+# Datagrams/sec delivered to a port nothing is bound to (Udp.NoPorts).
+# noports_min_rate = 5
+#
+# Packets/sec dropped because a receive queue was full (Udp.RcvbufErrors plus
+# TcpExt.ListenDrops/ListenOverflows). This one means a local program is too
+# slow or its buffer too small -- the traffic was wanted.
+# rcvbuf_min_rate = 10
+#
+# proto_sustain_secs = 60
+
+# -- Device names --
+# What you call your devices. Repeatable, and consulted before any lookup.
+# Key on a MAC to survive DHCP reshuffles, or on an address for devices that
+# never appear in the neighbour table. Without this an alert can only report
+# what it can discover: a vendor OUI gives the device *type*, so two identical
+# travel routers are both "GL", and mDNS gives whatever the firmware publishes,
+# which is often a serial number.
+#
+# name a8:b5:7c:53:b2:fe = Roku
+# name 10.3.59.7         = caldera
+
 # -- Output --
 # cooldown_secs = 1800
 # notify = true

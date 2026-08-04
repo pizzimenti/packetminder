@@ -122,6 +122,33 @@ fn vendor_cache() -> &'static VendorCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Names from the config, keyed by lowercase MAC or by address.
+static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+/// Install the configured names. Called once at startup — a global rather than
+/// a parameter because every label site would otherwise have to be handed the
+/// whole Config to look up one string.
+pub fn set_names(names: HashMap<String, String>) {
+    let _ = NAMES.set(names);
+}
+
+/// The name you chose for this device, if you named it.
+///
+/// Address first, then MAC. The MAC is the durable key — it survives a DHCP
+/// reshuffle, and it is the only thing that separates two devices whose vendor
+/// and firmware-published name are identical.
+fn chosen_name(ip: &str) -> Option<String> {
+    let names = NAMES.get()?;
+    if names.is_empty() {
+        return None;
+    }
+    if let Some(name) = names.get(ip) {
+        return Some(name.clone());
+    }
+    let mac = neighbour_mac(ip)?.to_lowercase();
+    names.get(&mac).cloned()
+}
+
 /// Name a device the way its owner would recognise it — `Roku (10.3.193.195)`,
 /// `caldera.lan (10.3.59.7)` — falling back to the bare address.
 ///
@@ -135,6 +162,11 @@ fn vendor_cache() -> &'static VendorCache {
 /// after a DHCP reshuffle, and the address is what you need to write a firewall
 /// rule or start a capture.
 pub fn device_label(ip: &str) -> String {
+    // A name you chose beats anything that can be discovered, always.
+    if let Some(name) = chosen_name(ip) {
+        return format!("{name} ({ip})");
+    }
+
     let named = hostname_for(ip);
     let short = named
         .as_deref()

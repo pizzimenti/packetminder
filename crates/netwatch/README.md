@@ -26,17 +26,20 @@ indefinitely.
 
 ## What it watches
 
-Two detectors, deliberately at different layers than the TUI:
+Detectors, deliberately at different layers than the TUI:
 
 | Detector | Source | Catches |
 | --- | --- | --- |
 | `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Under 5% outbound means this host is not part of the conversation. |
 | `blocked-flow` | kernel log, `[UFW BLOCK]` records | One source being dropped repeatedly for minutes, grouped by (source, protocol, destination port). Names the culprit exactly, and reports whether anything is actually listening on that port. |
 | `self-blocked` | the records `blocked-flow` rejects | Traffic *this host* sends that its own firewall drops. Not an attack, but not nothing — see below. |
+| `udp-no-listener` | `Udp.NoPorts`, `/proc/net/snmp` | Datagrams the kernel delivered to a port with no socket. The premise of this daemon, counted at the source — and unlike the drop log it covers traffic the firewall *allows* through to a dead port. |
+| `receive-overflow` | `Udp.RcvbufErrors`, `TcpExt.ListenDrops` | Traffic dropped because a receive queue was full. The inverse problem: something *is* listening and cannot keep up. Invisible everywhere else, because from outside it looks like traffic being consumed. |
 | `ipv6-active` | `ip addr`, every 60s | IPv6 addressing appeared on an interface that had none. |
 
-The two cross-reference: an interface-level alert includes whatever the drop log
-knows about who is responsible.
+The interface and drop-log detectors cross-reference: an interface-level alert
+carries whatever the drop log currently knows, labelled as concurrent rather
+than causal, since a handful of dropped packets cannot explain megabits.
 
 Sources are named rather than numbered wherever they resolve —
 `customer.sttlwax1.isp.starlink.com (2605:59ca:…)` rather than a bare address.
@@ -213,6 +216,24 @@ spanning 2 minutes, 30-minute cooldown per subject, no ignored ports.
 typo in one entry keeps the default rather than silently widening the blind
 spot. Prefer leaving it empty; if a port is noisy, the reason is usually
 something the structural filters above should be catching instead.
+
+### Naming devices
+
+```
+name a8:b5:7c:53:b2:fe = Roku
+name 10.3.59.7         = caldera
+```
+
+Repeatable, and consulted before any lookup. This exists because discovery can
+only ever report what a device is, not which one it is. An OUI gives the type,
+so two identical travel routers are both `GL`; mDNS gives whatever the firmware
+publishes, which for consumer hardware is frequently a serial number like
+`X01000EKSRNP.local`.
+
+Key on a MAC to survive a DHCP reshuffle, or on an address for devices that
+never appear in the neighbour table. Resolution order is: your name, then a
+hostname that looks like a person chose it, then the vendor behind the MAC,
+then the bare address.
 
 ## Logs
 

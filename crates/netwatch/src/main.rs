@@ -22,6 +22,7 @@ mod config;
 mod flows;
 mod iface;
 mod local;
+mod proto;
 mod selfblock;
 
 use std::{
@@ -39,6 +40,10 @@ use crate::{
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let cfg = Config::load();
+
+    // Every subcommand labels devices, so this has to happen before any of
+    // them run -- not just before the monitoring loop.
+    alert::set_names(cfg.names.clone());
 
     match args.first().map(String::as_str) {
         None => run(cfg),
@@ -86,6 +91,7 @@ fn run(cfg: Config) {
     let events = flows::spawn_follower(&cfg.block_pattern);
     let mut asym = AsymDetector::new();
     let mut tracker = FlowTracker::new();
+    let mut counters = proto::ProtoDetector::new();
     let mut last_self_summary = alert::now_epoch();
 
     // Seed the IPv6 set rather than treating whatever is already assigned as
@@ -112,6 +118,15 @@ fn run(cfg: Config) {
         let hint = tracker.recent_summary(3);
         for a in asym.tick(&cfg, hint) {
             alert::emit(&cfg, &a);
+        }
+
+        // Kernel counters. These see two things nothing else here can: traffic
+        // the firewall lets through to a dead port, and traffic this host
+        // wanted but could not drain fast enough.
+        if cfg.watch_proto {
+            for a in counters.tick(&cfg) {
+                alert::emit(&cfg, &a);
+            }
         }
 
         // Record this host's own blocked traffic periodically even when it is
