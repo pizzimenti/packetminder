@@ -42,6 +42,17 @@ pub struct Config {
     /// reason those filters cannot see.
     pub ignore_ports: Vec<u16>,
 
+    // -- Self-blocked detector --
+    /// Rolling window for judging this host's own blocked traffic, in seconds.
+    pub self_window_secs: u64,
+    /// Alert once its own multicast has been dropped in this many distinct
+    /// minutes of the window. Minutes rather than records, because ufw's log
+    /// limiter caps records per minute and would otherwise set the ceiling.
+    pub self_min_active_minutes: usize,
+    /// Locally-sourced *unicast* on the input path has no benign explanation,
+    /// so it needs only enough records to rule out a one-off.
+    pub self_unicast_min_events: u64,
+
     // -- Output --
     /// Minimum seconds between repeat alerts for the same subject.
     pub cooldown_secs: u64,
@@ -72,6 +83,14 @@ impl Default for Config {
             block_window_secs: 900,
             block_min_span_secs: 120,
             ignore_ports: Vec::new(),
+
+            // An hour of context, alerting at half of it. The observed benign
+            // case — systemd-resolved's LLMNR retries — is active in about five
+            // minutes of any given hour, so this leaves real headroom rather
+            // than sitting just above the noise.
+            self_window_secs: 3600,
+            self_min_active_minutes: 30,
+            self_unicast_min_events: 4,
 
             cooldown_secs: 1800,
             notify: true,
@@ -138,6 +157,9 @@ impl Config {
                         None => false,
                     }
                 }
+                "self_window_secs" => set_u64(&mut cfg.self_window_secs, value),
+                "self_min_active_minutes" => set_usize(&mut cfg.self_min_active_minutes, value),
+                "self_unicast_min_events" => set_u64(&mut cfg.self_unicast_min_events, value),
                 "cooldown_secs" => set_u64(&mut cfg.cooldown_secs, value),
                 "notify" => {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");
@@ -184,13 +206,15 @@ impl Config {
         format!(
             "interval={}s rx_floor={:.1}Mbps asym_ratio={:.0}% sustain={}s \
              block_min_events={} block_min_span={}s ignore_ports={ignored} \
-             cooldown={}s notify={}",
+             self_window={}s self_min_active_minutes={} cooldown={}s notify={}",
             self.interval_secs,
             self.rx_floor_bps / 1_000_000.0,
             self.asym_ratio * 100.0,
             self.asym_sustain_secs,
             self.block_min_events,
             self.block_min_span_secs,
+            self.self_window_secs,
+            self.self_min_active_minutes,
             self.cooldown_secs,
             self.notify,
         )

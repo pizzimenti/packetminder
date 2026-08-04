@@ -33,6 +33,7 @@ use crate::{
     },
     config::Config,
     local::{LocalNet, parse_ip},
+    selfblock::SelfBlockTracker,
 };
 
 // -- Data Structures ----------------------------------------------------------
@@ -106,6 +107,9 @@ pub struct FlowTracker {
     flows: HashMap<FlowKey, FlowState>,
     local: LocalNet,
     skipped: SkipCounts,
+    /// Records this detector rejects are not thrown away — traffic this host
+    /// sends and then drops is a different problem, judged on its own terms.
+    selfblock: SelfBlockTracker,
 }
 
 // -- Journal Follower ---------------------------------------------------------
@@ -203,11 +207,18 @@ impl FlowTracker {
             flows: HashMap::new(),
             local,
             skipped: SkipCounts::default(),
+            selfblock: SelfBlockTracker::new(),
         }
     }
 
     pub fn skipped(&self) -> SkipCounts {
         self.skipped
+    }
+
+    /// What this host is currently having dropped by its own firewall, whether
+    /// or not it has crossed the alerting threshold.
+    pub fn selfblock_summary(&self) -> Option<String> {
+        self.selfblock.summary()
     }
 
     /// Decide whether a drop record can possibly indicate misdirected traffic.
@@ -228,6 +239,11 @@ impl FlowTracker {
             && self.local.is_local(&src)
         {
             self.skipped.self_sourced += 1;
+            // Nobody is transmitting at this host, so the flood detector must
+            // not see it. That does not make it uninteresting. An unparseable
+            // destination counts as a group, so garbage takes the quiet path.
+            let unicast = parse_ip(&event.dst).is_some_and(|dst| !self.local.is_group(&dst));
+            self.selfblock.record(event, unicast);
             return false;
         }
 
@@ -337,6 +353,8 @@ impl FlowTracker {
         for key in finished {
             self.flows.remove(&key);
         }
+
+        alerts.extend(self.selfblock.tick_at(cfg, now));
         alerts
     }
 

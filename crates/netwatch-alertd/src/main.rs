@@ -22,6 +22,7 @@ mod config;
 mod flows;
 mod iface;
 mod local;
+mod selfblock;
 
 use std::{env, path::PathBuf, process::Command, thread, time::Duration};
 
@@ -69,12 +70,17 @@ Config: {}",
 
 // -- Main Loop ----------------------------------------------------------------
 
+/// How often the event log records what this host is having dropped, whether or
+/// not it is anywhere near alerting.
+const SELF_SUMMARY_SECS: i64 = 3600;
+
 fn run(cfg: Config) {
     alert::log(&cfg, &format!("started — {}", cfg.summary()));
 
     let events = flows::spawn_follower(&cfg.block_pattern);
     let mut asym = AsymDetector::new();
     let mut tracker = FlowTracker::new();
+    let mut last_self_summary = alert::now_epoch();
 
     loop {
         // Drain everything the follower has seen since the last tick.
@@ -91,6 +97,18 @@ fn run(cfg: Config) {
         let hint = tracker.recent_summary(3);
         for a in asym.tick(&cfg, hint) {
             alert::emit(&cfg, &a);
+        }
+
+        // Record this host's own blocked traffic periodically even when it is
+        // nowhere near the alert threshold. It is still consuming the ufw log
+        // budget, and a line in the event log is what keeps that recoverable
+        // rather than merely filtered away.
+        let now = alert::now_epoch();
+        if now - last_self_summary >= SELF_SUMMARY_SECS {
+            last_self_summary = now;
+            if let Some(summary) = tracker.selfblock_summary() {
+                alert::log(&cfg, &format!("self-blocked — {summary}"));
+            }
         }
 
         thread::sleep(Duration::from_secs(cfg.interval_secs));

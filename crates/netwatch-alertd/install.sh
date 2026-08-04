@@ -55,6 +55,18 @@ if [[ ! -f "$config_dir/alertd.conf" ]]; then
 # so a typo keeps the default rather than widening the blind spot.
 # ignore_ports = 5355, 5353
 
+# -- Self-blocked detector --
+# Traffic this host sends that its own firewall drops. Thresholded on how many
+# distinct minutes of the window saw activity, not on how many records were
+# logged -- ufw rate-limits its own logging, so a record count measures the
+# limiter more than the traffic.
+# self_window_secs = 3600
+# self_min_active_minutes = 30
+#
+# Locally-sourced unicast on the input path has no benign explanation, so it
+# alerts on this many records regardless of the window.
+# self_unicast_min_events = 4
+
 # -- Output --
 # cooldown_secs = 1800
 # notify = true

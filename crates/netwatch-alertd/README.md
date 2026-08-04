@@ -32,6 +32,7 @@ Two detectors, deliberately at different layers than the TUI:
 | --- | --- | --- |
 | `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Under 5% outbound means this host is not part of the conversation. |
 | `blocked-flow` | kernel log, `[UFW BLOCK]` records | One source being dropped repeatedly for minutes, grouped by (source, protocol, destination port). Names the culprit exactly, and reports whether anything is actually listening on that port. |
+| `self-blocked` | the records `blocked-flow` rejects | Traffic *this host* sends that its own firewall drops. Not an attack, but not nothing — see below. |
 
 The two cross-reference: an interface-level alert includes whatever the drop log
 knows about who is responsible.
@@ -94,6 +95,44 @@ The filters are structural rather than a port list, which is why `ignore_ports`
 defaults to empty and should usually stay that way. Note that they overlap on
 purpose: this host's IPv6 LLMNR queries are caught as self-sourced while its
 link-local address is assigned, and as group-addressed regardless.
+
+## What it does with them instead
+
+Filtering self-sourced records out of `blocked-flow` is right — nobody is
+transmitting at this host. Discarding them would not be. Over 7 days, 361 of
+4287 ufw records on this machine (8.4%) were locally generated, and that matters
+for three reasons:
+
+1. **It consumes the log budget.** ufw rate-limits its own logging, which is why
+   a 2.7 Mbps flood produced 34 records. Every self-inflicted record is one a
+   real event does not get.
+2. **It proves the same traffic is blocked inbound.** The looped copy and a
+   peer's reply take the same path. If mDNS discovery is meant to work here,
+   this is how you find out it cannot.
+3. **Some of it is genuinely wrong.** Benign loopback is *always* addressed to a
+   multicast or broadcast group. Locally-sourced **unicast** arriving on the
+   input path is a routing loop, a misconfigured tunnel, or a spoofed source.
+
+So they go to a second detector, keyed on destination — the source is always us,
+so it carries no information.
+
+**The threshold counts distinct minutes with activity, not records.** That
+distinction is the whole design. ufw's limiter caps records per minute, so a
+record count measures the limiter more than the traffic; which minutes saw
+activity survives it. systemd-resolved's LLMNR retries are three packets
+followed by eight quiet minutes — active in roughly five minutes of any hour,
+against a default threshold of 30. A program stuck in a retry loop is active in
+nearly all sixty. Self-sourced unicast skips the threshold entirely and alerts
+`critical` on 4 records, because no volume of it is normal.
+
+Below the threshold, the counts still reach the event log hourly, so
+sub-threshold self-traffic is visible rather than merely filtered.
+
+One caveat specific to this detector: it depends on recognising this host's own
+addresses, so on a machine that roams it under-reports in `--replay`. A 7-day
+replay attributed only 16 records to this host against 361 that were actually
+locally generated, because the rest arrived under addresses it no longer has.
+Live operation re-reads every 60 seconds and gets it right.
 
 `--replay` prints what it discarded and why, so a quiet result always reads as
 "these were filtered on purpose" rather than as an unexplained absence.
