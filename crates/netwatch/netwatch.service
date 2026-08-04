@@ -10,13 +10,10 @@ ExecStart=%h/.local/bin/netwatch
 Restart=on-failure
 RestartSec=10s
 
-# StateDirectory creates and owns %S/netwatch, which is where the event log
-# lives. Pointing log_path outside it means relaxing ProtectHome below.
-StateDirectory=netwatch
-
 # The daemon reads /proc/net/*, tails the journal, and shells out to
-# notify-send, getent, ip and whois. It never needs to write outside its state
-# directory and never needs elevated privileges.
+# notify-send, getent, ip and whois. It logs to stderr, which lands in the
+# journal, so it never needs to write to disk at all and never needs elevated
+# privileges.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

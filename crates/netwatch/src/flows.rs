@@ -316,7 +316,6 @@ impl FlowTracker {
                 if now - state.last > window {
                     if state.alerted_at.is_some() {
                         alert::log(
-                            cfg,
                             &format!(
                                 "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
                                 host_label(&key.src),

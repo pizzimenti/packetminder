@@ -66,8 +66,6 @@ pub struct Config {
     pub cooldown_secs: u64,
     /// Whether to raise desktop notifications.
     pub notify: bool,
-    /// Append-only event log.
-    pub log_path: PathBuf,
 }
 
 impl Default for Config {
@@ -104,7 +102,6 @@ impl Default for Config {
 
             cooldown_secs: 1800,
             notify: true,
-            log_path: state_dir().join("netwatch.log"),
         }
     }
 }
@@ -179,10 +176,6 @@ impl Config {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");
                     true
                 }
-                "log_path" => {
-                    cfg.log_path = PathBuf::from(expand_home(value));
-                    true
-                }
                 _ => {
                     eprintln!("{}:{}: unknown key `{key}`", path.display(), lineno + 1);
                     true
@@ -247,20 +240,6 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| home().join(".config"))
         .join("netwatch")
         .join("netwatch.conf")
-}
-
-pub fn state_dir() -> PathBuf {
-    env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local").join("state"))
-        .join("netwatch")
-}
-
-fn expand_home(value: &str) -> String {
-    match value.strip_prefix("~/") {
-        Some(rest) => home().join(rest).to_string_lossy().into_owned(),
-        None => value.to_string(),
-    }
 }
 
 // -- Parsing Helpers ----------------------------------------------------------

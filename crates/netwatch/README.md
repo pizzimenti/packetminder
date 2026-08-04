@@ -126,7 +126,7 @@ against a default threshold of 30. A program stuck in a retry loop is active in
 nearly all sixty. Self-sourced unicast skips the threshold entirely and alerts
 `critical` on 4 records, because no volume of it is normal.
 
-Below the threshold, the counts still reach the event log hourly, so
+Below the threshold, the counts still reach the journal hourly, so
 sub-threshold self-traffic is visible rather than merely filtered.
 
 One caveat specific to this detector: it depends on recognising this host's own
@@ -214,8 +214,22 @@ typo in one entry keeps the default rather than silently widening the blind
 spot. Prefer leaving it empty; if a port is noisy, the reason is usually
 something the structural filters above should be catching instead.
 
-Pointing `log_path` outside `~/.local/state/netwatch` requires relaxing
-`ProtectHome=` in the unit.
+## Logs
+
+The journal, and only the journal:
+
+```sh
+journalctl --user -u netwatch -f        # follow
+journalctl --user -u netwatch -S -7d    # last week
+```
+
+There is no second log file. systemd already timestamps, rotates and caps what
+it stores, and every alert is written to stderr, so a hand-rolled copy on disk
+was a duplicate that could grow without bound. The daemon writes nothing to
+disk at all now, which is why the unit needs no `StateDirectory=`.
+
+Retention is journald's, set in `/etc/systemd/journald.conf.d/limits.conf`
+(`SystemMaxUse=200M`, currently about three weeks of history on this machine).
 
 ## Privileges
 

@@ -2,15 +2,18 @@
 // alert — event log, desktop notifications, and source enrichment.
 //
 // Detectors produce an `Alert`; this module is the only thing that decides how
-// it reaches a human. Every alert is appended to the log unconditionally and
-// echoed to stderr (so it lands in the journal); notification is best-effort.
+// it reaches a human. Every alert is written to stderr unconditionally, which
+// under the systemd user unit is the journal; notification is best-effort.
+//
+// The journal is the only log. It already timestamps, rotates and caps what it
+// stores, and `journalctl --user -u netwatch` queries it, so keeping a second
+// hand-rolled copy on disk bought nothing but a file that could grow forever.
 // =============================================================================
 
 use std::{
     collections::HashMap,
     fmt::Write as _,
-    fs::{self, OpenOptions},
-    io::Write as _,
+    fs,
     net::Ipv4Addr,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc::channel},
@@ -37,36 +40,20 @@ pub struct Alert {
 
 pub fn emit(cfg: &Config, alert: &Alert) {
     let flat = alert.body.replace('\n', " | ");
-    log(cfg, &format!("{} — {} | {}", alert.kind, alert.title, flat));
+    log(&format!("{} — {} | {}", alert.kind, alert.title, flat));
 
     if cfg.notify {
         notify(alert);
     }
 }
 
-/// Append a timestamped line to the event log and echo it to stderr.
-pub fn log(cfg: &Config, message: &str) {
-    let line = format!("{} {}\n", fmt_iso_local(now_epoch()), message);
-    eprint!("{line}");
-
-    if let Some(parent) = cfg.log_path.parent()
-        && let Err(e) = fs::create_dir_all(parent)
-    {
-        eprintln!("netwatch: cannot create {}: {e}", parent.display());
-        return;
-    }
-
-    match OpenOptions::new().create(true).append(true).open(&cfg.log_path) {
-        Ok(mut fh) => {
-            if let Err(e) = fh.write_all(line.as_bytes()) {
-                eprintln!("netwatch: cannot write log: {e}");
-            }
-        }
-        Err(e) => eprintln!(
-            "netwatch: cannot open {}: {e}",
-            cfg.log_path.display()
-        ),
-    }
+/// Write a timestamped line to stderr, which the user unit routes to the
+/// journal.
+///
+/// The timestamp is redundant under systemd, which stamps every entry itself,
+/// but it keeps the line self-describing when the daemon is run by hand.
+pub fn log(message: &str) {
+    eprint!("{} {}\n", fmt_iso_local(now_epoch()), message);
 }
 
 fn notify(alert: &Alert) {

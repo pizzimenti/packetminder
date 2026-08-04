@@ -25,7 +25,7 @@ mod local;
 mod selfblock;
 
 use std::{
-    collections::HashSet, env, net::IpAddr, path::PathBuf, process::Command, thread,
+    collections::HashSet, env, net::IpAddr, process::Command, thread,
     time::Duration,
 };
 
@@ -81,7 +81,7 @@ const SELF_SUMMARY_SECS: i64 = 3600;
 const IPV6_CHECK_SECS: i64 = 60;
 
 fn run(cfg: Config) {
-    alert::log(&cfg, &format!("started — {}", cfg.summary()));
+    alert::log(&format!("started — {}", cfg.summary()));
 
     let events = flows::spawn_follower(&cfg.block_pattern);
     let mut asym = AsymDetector::new();
@@ -94,7 +94,7 @@ fn run(cfg: Config) {
     let mut ipv6_seen = local::ipv6_addrs();
     let mut last_ipv6_check = alert::now_epoch();
     if cfg.watch_ipv6 {
-        alert::log(&cfg, &format!("ipv6 at startup — {}", describe_ipv6(&ipv6_seen)));
+        alert::log(&format!("ipv6 at startup — {}", describe_ipv6(&ipv6_seen)));
     }
 
     loop {
@@ -122,7 +122,7 @@ fn run(cfg: Config) {
         if now - last_self_summary >= SELF_SUMMARY_SECS {
             last_self_summary = now;
             if let Some(summary) = tracker.selfblock_summary() {
-                alert::log(&cfg, &format!("self-blocked — {summary}"));
+                alert::log(&format!("self-blocked — {summary}"));
             }
         }
 
@@ -186,12 +186,11 @@ fn check_ipv6(seen: &mut HashSet<IpAddr>) -> Option<Alert> {
 /// This is the honest way to tune thresholds: point it at a period when
 /// something was actually wrong and confirm it fires, then point it at a
 /// normal day and confirm it stays quiet.
-fn replay(mut cfg: Config, since: &str) {
-    // Replay is meant to be read-only. Left alone it appends its findings to
-    // the real event log stamped with today's time, which corrupts the very
-    // history it exists to examine. Findings still reach stderr.
-    cfg.log_path = PathBuf::from("/dev/null");
-
+fn replay(cfg: Config, since: &str) {
+    // Replay is read-only by construction now that findings only go to stderr.
+    // It used to need log_path pointed at /dev/null, because otherwise it
+    // appended its findings to the event log stamped with today's time and
+    // corrupted the very history it exists to examine.
     println!("Replaying kernel drops since {since} with: {}\n", cfg.summary());
 
     let output = Command::new("journalctl")
@@ -311,5 +310,5 @@ fn selftest(cfg: Config) {
         urgency: "normal",
     };
     alert::emit(&cfg, &a);
-    println!("Emitted a test alert. Log: {}", cfg.log_path.display());
+    println!("Emitted a test alert. See: journalctl --user -u netwatch");
 }
