@@ -33,6 +33,7 @@ Two detectors, deliberately at different layers than the TUI:
 | `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Under 5% outbound means this host is not part of the conversation. |
 | `blocked-flow` | kernel log, `[UFW BLOCK]` records | One source being dropped repeatedly for minutes, grouped by (source, protocol, destination port). Names the culprit exactly, and reports whether anything is actually listening on that port. |
 | `self-blocked` | the records `blocked-flow` rejects | Traffic *this host* sends that its own firewall drops. Not an attack, but not nothing — see below. |
+| `ipv6-active` | `ip addr`, every 60s | IPv6 addressing appeared on an interface that had none. |
 
 The two cross-reference: an interface-level alert includes whatever the drop log
 knows about who is responsible.
@@ -133,6 +134,34 @@ addresses, so on a machine that roams it under-reports in `--replay`. A 7-day
 replay attributed only 16 records to this host against 361 that were actually
 locally generated, because the rest arrived under addresses it no longer has.
 Live operation re-reads every 60 seconds and gets it right.
+
+## Watching IPv6
+
+Every address test here — self-sourced, group-addressed, on-link — already
+handles IPv6, and handles it as a first-class case rather than an afterthought:
+addresses are compared parsed so the kernel's expanded form matches `ip`'s
+compressed one, and `is_on_link` exists specifically because IPv6 has no NAT and
+so no address-class shortcut. None of that depends on IPv6 being up when the
+service starts; the address set is re-read every 60 seconds.
+
+On top of that, `ipv6-active` reports when IPv6 addressing appears on an
+interface that had none. It is a state change, not a judgement — equally useful
+if you expect IPv6 and want to know when it arrived. Only appearances are
+reported: addresses going away is an interface being reconfigured or unplugged,
+which happens constantly on a machine that roams and says nothing about whether
+IPv6 is enabled. Whatever is assigned at startup is seeded rather than announced,
+so restarting the service is not an event. Set `watch_ipv6 = false` to disable.
+
+The reason it exists: on this host, `/etc/sysctl.d/99-disable-ipv6.conf` has
+disabled IPv6 since 2026-02-22, and IPv6 was nevertheless fully up on
+`enp3s0f3u2` — with a routable Starlink `/64` — as recently as this morning.
+**NetworkManager overrides the sysctl per interface.** A connection profile with
+`ipv6.method=auto` clears `disable_ipv6` for its own interface when it
+activates, and 66 of this machine's 82 saved profiles are set that way. Every
+newly joined network adds another, because `auto` is the default and NM's
+connection-defaults mechanism does not accept `ipv6.method` as an overridable
+key. Anything short of `ipv6.disable=1` on the kernel command line is
+whack-a-mole, so the tool assumes IPv6 can come back at any time.
 
 `--replay` prints what it discarded and why, so a quiet result always reads as
 "these were filtered on purpose" rather than as an unexplained absence.

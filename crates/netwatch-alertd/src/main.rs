@@ -24,7 +24,10 @@ mod iface;
 mod local;
 mod selfblock;
 
-use std::{env, path::PathBuf, process::Command, thread, time::Duration};
+use std::{
+    collections::HashSet, env, net::IpAddr, path::PathBuf, process::Command, thread,
+    time::Duration,
+};
 
 use crate::{
     alert::Alert,
@@ -74,6 +77,9 @@ Config: {}",
 /// not it is anywhere near alerting.
 const SELF_SUMMARY_SECS: i64 = 3600;
 
+/// How often the set of assigned IPv6 addresses is re-read.
+const IPV6_CHECK_SECS: i64 = 60;
+
 fn run(cfg: Config) {
     alert::log(&cfg, &format!("started — {}", cfg.summary()));
 
@@ -81,6 +87,15 @@ fn run(cfg: Config) {
     let mut asym = AsymDetector::new();
     let mut tracker = FlowTracker::new();
     let mut last_self_summary = alert::now_epoch();
+
+    // Seed the IPv6 set rather than treating whatever is already assigned as
+    // having just appeared, which would fire on every restart. Startup state
+    // goes to the log instead, where it is a fact rather than an interruption.
+    let mut ipv6_seen = local::ipv6_addrs();
+    let mut last_ipv6_check = alert::now_epoch();
+    if cfg.watch_ipv6 {
+        alert::log(&cfg, &format!("ipv6 at startup — {}", describe_ipv6(&ipv6_seen)));
+    }
 
     loop {
         // Drain everything the follower has seen since the last tick.
@@ -111,8 +126,57 @@ fn run(cfg: Config) {
             }
         }
 
+        if cfg.watch_ipv6 && now - last_ipv6_check >= IPV6_CHECK_SECS {
+            last_ipv6_check = now;
+            if let Some(a) = check_ipv6(&mut ipv6_seen) {
+                alert::emit(&cfg, &a);
+            }
+        }
+
         thread::sleep(Duration::from_secs(cfg.interval_secs));
     }
+}
+
+// -- IPv6 Watch ---------------------------------------------------------------
+
+fn describe_ipv6(addrs: &HashSet<IpAddr>) -> String {
+    if addrs.is_empty() {
+        return "none assigned".to_string();
+    }
+    let mut listed: Vec<String> = addrs.iter().map(IpAddr::to_string).collect();
+    listed.sort();
+    listed.join(", ")
+}
+
+/// Report IPv6 addresses that were not there last time, updating `seen`.
+///
+/// Only appearances are reported. Addresses going away is the interface being
+/// reconfigured or unplugged, which happens constantly on a machine that roams
+/// and says nothing about whether IPv6 is enabled.
+fn check_ipv6(seen: &mut HashSet<IpAddr>) -> Option<Alert> {
+    let current = local::ipv6_addrs();
+    let mut appeared: Vec<String> = current.difference(seen).map(IpAddr::to_string).collect();
+    *seen = current;
+
+    if appeared.is_empty() {
+        return None;
+    }
+    appeared.sort();
+
+    Some(Alert {
+        kind: "ipv6-active",
+        key: "ipv6-active".to_string(),
+        title: "IPv6 addressing became active".to_string(),
+        body: format!(
+            "New IPv6 address(es): {}.\n\
+             Something enabled IPv6 on an interface that did not have it. Where IPv6 is meant \
+             to stay off, the usual cause is NetworkManager rather than the kernel: a profile \
+             with ipv6.method=auto clears disable_ipv6 for its own interface, which overrides \
+             anything set in /etc/sysctl.d.",
+            appeared.join(", ")
+        ),
+        urgency: "normal",
+    })
 }
 
 // -- Replay -------------------------------------------------------------------

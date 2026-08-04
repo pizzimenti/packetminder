@@ -67,6 +67,12 @@ if [[ ! -f "$config_dir/alertd.conf" ]]; then
 # alerts on this many records regardless of the window.
 # self_unicast_min_events = 4
 
+# -- IPv6 watch --
+# Report when IPv6 addressing appears on an interface that had none. A state
+# change, not a judgement -- useful whether you want IPv6 off and need to know
+# it came back, or expect it and want to know when it arrived.
+# watch_ipv6 = true
+
 # -- Output --
 # cooldown_secs = 1800
 # notify = true

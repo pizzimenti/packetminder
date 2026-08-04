@@ -53,6 +53,14 @@ pub struct Config {
     /// so it needs only enough records to rule out a one-off.
     pub self_unicast_min_events: u64,
 
+    // -- IPv6 watch --
+    /// Report when IPv6 addressing becomes active where there was none.
+    ///
+    /// A plain state-change notice, not a judgement: it is useful whether you
+    /// are trying to keep IPv6 off and want to know it came back, or expect it
+    /// on and want to know when it actually arrived.
+    pub watch_ipv6: bool,
+
     // -- Output --
     /// Minimum seconds between repeat alerts for the same subject.
     pub cooldown_secs: u64,
@@ -91,6 +99,8 @@ impl Default for Config {
             self_window_secs: 3600,
             self_min_active_minutes: 30,
             self_unicast_min_events: 4,
+
+            watch_ipv6: true,
 
             cooldown_secs: 1800,
             notify: true,
@@ -160,6 +170,10 @@ impl Config {
                 "self_window_secs" => set_u64(&mut cfg.self_window_secs, value),
                 "self_min_active_minutes" => set_usize(&mut cfg.self_min_active_minutes, value),
                 "self_unicast_min_events" => set_u64(&mut cfg.self_unicast_min_events, value),
+                "watch_ipv6" => {
+                    cfg.watch_ipv6 = matches!(value, "1" | "true" | "yes" | "on");
+                    true
+                }
                 "cooldown_secs" => set_u64(&mut cfg.cooldown_secs, value),
                 "notify" => {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");

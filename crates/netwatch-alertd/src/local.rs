@@ -192,6 +192,22 @@ fn read_addrs() -> Addrs {
     have
 }
 
+/// Every IPv6 address currently assigned, loopback excluded.
+///
+/// Link-local counts rather than being filtered as a detail: `fe80::…`
+/// appearing on an interface means the IPv6 stack came up there, which is
+/// precisely the event worth noticing on a host that is trying to keep IPv6
+/// off. Something re-enabling it is not hypothetical here — 66 of this
+/// machine's 82 saved connection profiles carry `ipv6.method=auto`, and
+/// NetworkManager clears `disable_ipv6` per interface for every one of them.
+pub fn ipv6_addrs() -> HashSet<IpAddr> {
+    read_addrs()
+        .addrs
+        .into_iter()
+        .filter(|ip| ip.is_ipv6() && !ip.is_loopback())
+        .collect()
+}
+
 /// Parse `addr/prefixlen`. A bare address is treated as a host route, which is
 /// what `ip` means when it omits the prefix.
 fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
