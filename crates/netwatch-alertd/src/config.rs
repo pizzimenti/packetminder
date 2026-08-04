@@ -34,6 +34,13 @@ pub struct Config {
     pub block_window_secs: u64,
     /// A flow must persist at least this long to count as sustained.
     pub block_min_span_secs: u64,
+    /// Destination ports to discard outright.
+    ///
+    /// Empty by default, and it should usually stay that way: the structural
+    /// filters in `local` already remove the chatter that would otherwise want
+    /// listing here. Reach for this only when one specific port is noisy for a
+    /// reason those filters cannot see.
+    pub ignore_ports: Vec<u16>,
 
     // -- Output --
     /// Minimum seconds between repeat alerts for the same subject.
@@ -64,6 +71,7 @@ impl Default for Config {
             block_min_events: 4,
             block_window_secs: 900,
             block_min_span_secs: 120,
+            ignore_ports: Vec::new(),
 
             cooldown_secs: 1800,
             notify: true,
@@ -113,6 +121,23 @@ impl Config {
                 "block_min_events" => set_usize(&mut cfg.block_min_events, value),
                 "block_window_secs" => set_u64(&mut cfg.block_window_secs, value),
                 "block_min_span_secs" => set_u64(&mut cfg.block_min_span_secs, value),
+                "ignore_ports" => {
+                    // All-or-nothing: a typo in one entry silently widening the
+                    // blind spot is worse than keeping the default.
+                    let parsed: Option<Vec<u16>> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.parse().ok())
+                        .collect();
+                    match parsed {
+                        Some(ports) => {
+                            cfg.ignore_ports = ports;
+                            true
+                        }
+                        None => false,
+                    }
+                }
                 "cooldown_secs" => set_u64(&mut cfg.cooldown_secs, value),
                 "notify" => {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");
@@ -146,9 +171,20 @@ impl Config {
 
     /// One-line description of the active thresholds, for the startup log entry.
     pub fn summary(&self) -> String {
+        let ignored = if self.ignore_ports.is_empty() {
+            "none".to_string()
+        } else {
+            self.ignore_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
         format!(
             "interval={}s rx_floor={:.1}Mbps asym_ratio={:.0}% sustain={}s \
-             block_min_events={} block_min_span={}s cooldown={}s notify={}",
+             block_min_events={} block_min_span={}s ignore_ports={ignored} \
+             cooldown={}s notify={}",
             self.interval_secs,
             self.rx_floor_bps / 1_000_000.0,
             self.asym_ratio * 100.0,

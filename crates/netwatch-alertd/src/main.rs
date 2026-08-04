@@ -21,8 +21,9 @@ mod alert;
 mod config;
 mod flows;
 mod iface;
+mod local;
 
-use std::{env, process::Command, thread, time::Duration};
+use std::{env, path::PathBuf, process::Command, thread, time::Duration};
 
 use crate::{
     alert::Alert,
@@ -78,7 +79,7 @@ fn run(cfg: Config) {
     loop {
         // Drain everything the follower has seen since the last tick.
         while let Ok(event) = events.try_recv() {
-            tracker.record(event);
+            tracker.record(event, &cfg);
         }
 
         for a in tracker.tick(&cfg) {
@@ -103,7 +104,12 @@ fn run(cfg: Config) {
 /// This is the honest way to tune thresholds: point it at a period when
 /// something was actually wrong and confirm it fires, then point it at a
 /// normal day and confirm it stays quiet.
-fn replay(cfg: Config, since: &str) {
+fn replay(mut cfg: Config, since: &str) {
+    // Replay is meant to be read-only. Left alone it appends its findings to
+    // the real event log stamped with today's time, which corrupts the very
+    // history it exists to examine. Findings still reach stderr.
+    cfg.log_path = PathBuf::from("/dev/null");
+
     println!("Replaying kernel drops since {since} with: {}\n", cfg.summary());
 
     let output = Command::new("journalctl")
@@ -151,7 +157,7 @@ fn replay(cfg: Config, since: &str) {
     let mut alerts: Vec<(i64, Alert)> = Vec::new();
     for event in events {
         let ts = event.ts;
-        tracker.record(event);
+        tracker.record(event, &cfg);
         for a in tracker.tick_at(&cfg, ts) {
             alerts.push((ts, a));
         }
@@ -159,6 +165,12 @@ fn replay(cfg: Config, since: &str) {
     // Final sweep so flows that ended are reported as ended.
     for a in tracker.tick_at(&cfg, last + cfg.block_window_secs as i64 + 1) {
         alerts.push((last, a));
+    }
+
+    // Say what was filtered out. A quiet replay should be readable as "these
+    // were discarded on purpose", never as an unexplained absence of results.
+    if let Some(skipped) = tracker.skipped().summary() {
+        println!("{skipped}\n");
     }
 
     if alerts.is_empty() {
@@ -180,7 +192,7 @@ fn replay(cfg: Config, since: &str) {
 
 fn status(cfg: Config) {
     let mut detector = AsymDetector::new();
-    thread::sleep(Duration::from_secs(cfg.interval_secs.min(5).max(2)));
+    thread::sleep(Duration::from_secs(cfg.interval_secs.clamp(2, 5)));
     detector.tick(&cfg, None);
 
     println!("{}\n", cfg.summary());

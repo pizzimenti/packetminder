@@ -8,6 +8,11 @@
 // precisely the failure that is invisible everywhere else, because a silent
 // DROP gives the sender no feedback at all.
 //
+// That premise only holds for unicast traffic from somebody else, so `local`
+// filters out the two classes of drop that cannot possibly mean it: packets
+// this host sent itself, and packets addressed to a multicast or broadcast
+// group. See that module for why both are false by construction.
+//
 // Reading the journal costs nothing and needs no privileges beyond membership
 // in a group that can read kernel messages.
 // =============================================================================
@@ -22,8 +27,12 @@ use std::{
 };
 
 use crate::{
-    alert::{self, Alert, describe_source, fmt_duration, now_epoch, port_in_use},
+    alert::{
+        self, Alert, describe_source, fmt_bytes, fmt_duration, host_label, is_private, now_epoch,
+        port_in_use,
+    },
     config::Config,
+    local::{LocalNet, parse_ip},
 };
 
 // -- Data Structures ----------------------------------------------------------
@@ -33,11 +42,44 @@ pub struct BlockEvent {
     pub ts: i64,
     pub iface: String,
     pub src: String,
+    pub dst: String,
     pub proto: String,
     pub sport: u16,
     pub dport: u16,
     /// IP total length, i.e. bytes on the wire for this packet.
     pub len: u64,
+}
+
+/// Why records were discarded before reaching the tracker.
+///
+/// Counted rather than logged per packet: a chatty segment produces thousands
+/// of these an hour. Reported in `--replay` so a quiet result is visibly "these
+/// were filtered", never a silent nothing.
+#[derive(Default, Clone, Copy)]
+pub struct SkipCounts {
+    pub self_sourced: u64,
+    pub group_dest: u64,
+    pub ignored_port: u64,
+}
+
+impl SkipCounts {
+    pub fn total(&self) -> u64 {
+        self.self_sourced + self.group_dest + self.ignored_port
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        if self.total() == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} record(s) ignored: {} sent by this host, {} addressed to a multicast \
+             or broadcast group, {} on an ignored port",
+            self.total(),
+            self.self_sourced,
+            self.group_dest,
+            self.ignored_port,
+        ))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -62,6 +104,8 @@ struct FlowState {
 
 pub struct FlowTracker {
     flows: HashMap<FlowKey, FlowState>,
+    local: LocalNet,
+    skipped: SkipCounts,
 }
 
 // -- Journal Follower ---------------------------------------------------------
@@ -121,6 +165,7 @@ pub fn parse_line(line: &str) -> Option<BlockEvent> {
     }
 
     let src = (*fields.get("SRC")?).to_string();
+    let dst = (*fields.get("DST")?).to_string();
     let proto = (*fields.get("PROTO")?).to_string();
 
     // Timestamps come from the journal itself so that replaying history lands
@@ -135,6 +180,7 @@ pub fn parse_line(line: &str) -> Option<BlockEvent> {
         ts,
         iface: fields.get("IN").unwrap_or(&"?").to_string(),
         src,
+        dst,
         proto,
         sport: fields.get("SPT").and_then(|v| v.parse().ok()).unwrap_or(0),
         dport: fields.get("DPT").and_then(|v| v.parse().ok()).unwrap_or(0),
@@ -146,12 +192,61 @@ pub fn parse_line(line: &str) -> Option<BlockEvent> {
 
 impl FlowTracker {
     pub fn new() -> Self {
+        Self::with_local(LocalNet::detect(now_epoch()))
+    }
+
+    /// Build a tracker over a fixed view of this host's addresses. Used by
+    /// tests, which must not depend on whatever the machine's real addresses
+    /// happen to be.
+    pub fn with_local(local: LocalNet) -> Self {
         Self {
             flows: HashMap::new(),
+            local,
+            skipped: SkipCounts::default(),
         }
     }
 
-    pub fn record(&mut self, event: BlockEvent) {
+    pub fn skipped(&self) -> SkipCounts {
+        self.skipped
+    }
+
+    /// Decide whether a drop record can possibly indicate misdirected traffic.
+    ///
+    /// The address set is re-read on a timer rather than per packet, so a DHCP
+    /// renewal is picked up within a minute. `--replay` compares historical
+    /// records against today's addresses, which is the best available answer:
+    /// the journal does not record what this host's address was at the time.
+    fn should_record(&mut self, event: &BlockEvent, cfg: &Config) -> bool {
+        if cfg.ignore_ports.contains(&event.dport) {
+            self.skipped.ignored_port += 1;
+            return false;
+        }
+
+        self.local.refresh_if_stale(now_epoch());
+
+        if let Some(src) = parse_ip(&event.src)
+            && self.local.is_local(&src)
+        {
+            self.skipped.self_sourced += 1;
+            return false;
+        }
+
+        if let Some(dst) = parse_ip(&event.dst)
+            && self.local.is_group(&dst)
+        {
+            self.skipped.group_dest += 1;
+            return false;
+        }
+
+        true
+    }
+
+    /// Fold a drop record into its flow. Returns false if it was filtered out.
+    pub fn record(&mut self, event: BlockEvent, cfg: &Config) -> bool {
+        if !self.should_record(&event, cfg) {
+            return false;
+        }
+
         let key = FlowKey {
             src: event.src.clone(),
             proto: event.proto.clone(),
@@ -175,6 +270,7 @@ impl FlowTracker {
         state.last = event.ts;
         state.iface = event.iface;
         state.sport = event.sport;
+        true
     }
 
     pub fn tick(&mut self, cfg: &Config) -> Vec<Alert> {
@@ -207,7 +303,7 @@ impl FlowTracker {
                             cfg,
                             &format!(
                                 "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
-                                key.src,
+                                host_label(&key.src),
                                 key.proto.to_lowercase(),
                                 key.dport,
                                 fmt_duration((state.last - state.first).max(0) as u64),
@@ -263,7 +359,7 @@ impl FlowTracker {
             .map(|(k, s)| {
                 format!(
                     "{} → {}/{} ({} drops)",
-                    k.src,
+                    host_label(&k.src),
                     k.proto.to_lowercase(),
                     k.dport,
                     s.times.len()
@@ -281,14 +377,18 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64) -> Alert {
     let listening = port_in_use(&key.proto, key.dport);
 
     let mut body = format!(
-        "{} drops logged over {} on {}, still going.\n",
-        state.total, duration, state.iface,
+        "{} drops ({}) logged over {} on {}, still going.\n\
+         ufw rate-limits its own logging, so that measures persistence, not volume.\n",
+        state.total,
+        fmt_bytes(state.bytes),
+        duration,
+        state.iface,
     );
 
     if listening {
         body.push_str(&format!(
             "Something IS listening on {proto}/{} — the firewall is blocking traffic \
-             a local service wants.\n",
+             a local service wants. Allow it, or stop the sender.\n",
             key.dport
         ));
     } else {
@@ -304,12 +404,29 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64) -> Alert {
         body.push_str(&format!(" from {proto}/{}", state.sport));
     }
 
+    // Volume cannot be read off a rate-limited log, so urgency comes from what
+    // the situation means instead. A starved local service and a neighbour
+    // transmitting into a black hole are both somebody's mistake worth waking
+    // up for. The internet knocking on a closed port all day is just the
+    // internet, and does not get to interrupt anyone.
+    let urgency = if listening || is_private(&key.src) {
+        "critical"
+    } else {
+        "normal"
+    };
+
     Alert {
         kind: "blocked-flow",
+        // Keyed on the address and never the resolved name, so that the popup
+        // still replaces its predecessor when a name starts or stops resolving.
         key: format!("flow-{}-{}-{}", key.src, proto, key.dport),
-        title: format!("{} is flooding {proto}/{}", key.src, key.dport),
+        title: format!(
+            "{} keeps hitting blocked {proto}/{}",
+            host_label(&key.src),
+            key.dport
+        ),
         body,
-        urgency: "critical",
+        urgency,
     }
 }
 
@@ -363,14 +480,38 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
 
+    /// The real thing: a Sunshine host streaming into a port nothing was bound
+    /// to. Unicast, from a neighbour, addressed to this host.
     const SAMPLE: &str = "2026-08-03T00:50:53-07:00 ithilien kernel: [UFW BLOCK] IN=wlp1s0 OUT= \
         MAC=3c:3b:ad:16:b7:30:18:db:f2:4d:bb:ee:08:00 SRC=10.3.59.7 DST=10.3.153.246 LEN=1436 \
         TOS=0x00 PREC=0xA0 TTL=128 ID=40959 PROTO=UDP SPT=47998 DPT=37366 LEN=1416";
+
+    /// The false positive the filter exists for: systemd-resolved's own LLMNR
+    /// query, looped back into INPUT by the kernel and dropped by a default-deny
+    /// firewall. SRC is this host and MAC= is empty, because the packet never
+    /// reached the wire.
+    const OWN_LOOPBACK: &str = "2026-08-03T10:35:02-07:00 ithilien kernel: [UFW BLOCK] \
+        IN=wlp1s0 OUT= MAC= SRC=10.3.153.246 DST=224.0.0.252 LEN=54 TOS=0x00 PREC=0x00 TTL=255 \
+        ID=10390 PROTO=UDP SPT=5355 DPT=5355 LEN=34";
+
+    /// A neighbour's LLMNR query: genuinely from somebody else, but addressed to
+    /// the whole segment rather than to this host.
+    const NEIGHBOUR_MULTICAST: &str = "2026-08-03T10:12:52-07:00 ithilien kernel: [UFW BLOCK] \
+        IN=wlp1s0 OUT= MAC= SRC=fe80:0000:0000:0000:b787:4f5d:1cbb:eb39 \
+        DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=74 TC=0 HOPLIMIT=255 FLOWLBL=258456 \
+        PROTO=UDP SPT=5355 DPT=5355 LEN=34";
+
+    /// A tracker that believes it owns this machine's addresses, so tests never
+    /// depend on whatever the host running them actually has configured.
+    fn tracker() -> FlowTracker {
+        FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246"], &["10.3.255.255"]))
+    }
 
     #[test]
     fn parses_a_real_drop_record() {
         let event = parse_line(SAMPLE).expect("should parse");
         assert_eq!(event.src, "10.3.59.7");
+        assert_eq!(event.dst, "10.3.153.246");
         assert_eq!(event.iface, "wlp1s0");
         assert_eq!(event.proto, "UDP");
         assert_eq!(event.sport, 47998);
@@ -398,34 +539,82 @@ mod tests {
             block_min_span_secs: 120,
             ..Config::default()
         };
-
-        let mut tracker = FlowTracker::new();
         let base = 1_785_743_453;
-        for i in 0..6 {
-            tracker.record(BlockEvent {
-                ts: base + i * 40,
-                iface: "wlp1s0".into(),
-                src: "10.3.59.7".into(),
-                proto: "UDP".into(),
-                sport: 47998,
-                dport: 37366,
-                len: 1436,
-            });
-        }
-        assert_eq!(tracker.tick_at(&cfg, base + 200).len(), 1);
 
-        let mut brief = FlowTracker::new();
+        let mut sustained = tracker();
+        for i in 0..6 {
+            let mut event = parse_line(SAMPLE).expect("should parse");
+            event.ts = base + i * 40;
+            assert!(sustained.record(event, &cfg));
+        }
+        assert_eq!(sustained.tick_at(&cfg, base + 200).len(), 1);
+
+        let mut brief = tracker();
         for i in 0..3 {
-            brief.record(BlockEvent {
-                ts: base + i,
-                iface: "wlp1s0".into(),
-                src: "10.3.59.8".into(),
-                proto: "UDP".into(),
-                sport: 1234,
-                dport: 5678,
-                len: 100,
-            });
+            let mut event = parse_line(SAMPLE).expect("should parse");
+            event.ts = base + i;
+            event.src = "10.3.59.8".into();
+            assert!(brief.record(event, &cfg));
         }
         assert!(brief.tick_at(&cfg, base + 3).is_empty());
+    }
+
+    #[test]
+    fn never_alerts_on_this_hosts_own_loopback_multicast() {
+        let cfg = Config::default();
+        let base = 1_785_777_302;
+        let mut tracker = tracker();
+
+        // Well past both thresholds: only the filter can keep this quiet.
+        for i in 0..20 {
+            let mut event = parse_line(OWN_LOOPBACK).expect("should parse");
+            event.ts = base + i * 30;
+            assert!(!tracker.record(event, &cfg), "self-sourced must not record");
+        }
+
+        assert!(tracker.tick_at(&cfg, base + 600).is_empty());
+        assert_eq!(tracker.skipped().self_sourced, 20);
+    }
+
+    #[test]
+    fn never_alerts_on_traffic_addressed_to_a_group() {
+        let cfg = Config::default();
+        let base = 1_785_773_572;
+        let mut tracker = tracker();
+
+        for i in 0..20 {
+            let mut event = parse_line(NEIGHBOUR_MULTICAST).expect("should parse");
+            event.ts = base + i * 30;
+            assert!(!tracker.record(event, &cfg), "multicast must not record");
+        }
+
+        assert!(tracker.tick_at(&cfg, base + 600).is_empty());
+        // Source is a neighbour, so this can only have been caught by the
+        // destination check — the expanded IPv6 form and all.
+        assert_eq!(tracker.skipped().group_dest, 20);
+    }
+
+    #[test]
+    fn subnet_broadcast_counts_as_a_group_address() {
+        let cfg = Config::default();
+        let mut tracker = tracker();
+
+        let mut event = parse_line(SAMPLE).expect("should parse");
+        event.dst = "10.3.255.255".into();
+        assert!(!tracker.record(event, &cfg));
+        assert_eq!(tracker.skipped().group_dest, 1);
+    }
+
+    #[test]
+    fn ignore_ports_drops_records_before_anything_else() {
+        let cfg = Config {
+            ignore_ports: vec![37366],
+            ..Config::default()
+        };
+        let mut tracker = tracker();
+
+        let event = parse_line(SAMPLE).expect("should parse");
+        assert!(!tracker.record(event, &cfg));
+        assert_eq!(tracker.skipped().ignored_port, 1);
     }
 }

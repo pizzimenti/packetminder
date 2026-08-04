@@ -36,12 +36,51 @@ Two detectors, deliberately at different layers than the TUI:
 The two cross-reference: an interface-level alert includes whatever the drop log
 knows about who is responsible.
 
+Sources are named rather than numbered wherever they resolve —
+`customer.sttlwax1.isp.starlink.com (2605:59ca:…)` rather than a bare address.
+Lookups go through `getent`, so they use whatever nsswitch is configured with,
+which on a desktop means mDNS and systemd-resolved's cache and not just unicast
+PTR. The address is always kept alongside the name: a name alone is ambiguous
+after a DHCP reshuffle, and the address is what you need in order to write a
+firewall rule or start a capture. Results are cached for 5 minutes, negatives
+included, so a LAN without reverse records does not pay a lookup on every tick.
+
 A `blocked-flow` alert distinguishes two very different situations:
 
 - **Nothing listening** — someone is transmitting into the void. Tonight's case.
 - **Something IS listening** — the firewall is blocking traffic a local service
   wants. This is how the service found, on its first run, that ufw was dropping
   Tailscale's IPv6 peer traffic to `udp/41641` and forcing a DERP relay fallback.
+
+## What it deliberately ignores
+
+The blocked-flow detector answers exactly one question: *who is transmitting
+into a port nothing is listening on?* Two classes of drop record cannot answer
+it, and are discarded before the tracker ever sees them.
+
+**Packets this host sent itself.** When a program sends multicast, the kernel
+loops a copy back into `INPUT`, where a default-deny firewall drops and logs it.
+`SRC` is one of our own addresses and there is no `MAC=` field, because the
+packet never reached the wire.
+
+**Packets addressed to a group** — `224.0.0.0/4`, `ff00::/8`, `255.255.255.255`,
+and the subnet broadcast. LLMNR, mDNS, SSDP and NetBIOS shout at the whole
+segment continuously, by design. A drop there means "this host did not
+subscribe", not "this traffic was misdirected at this host".
+
+Both filters exist because of a real false positive: on 2026-08-03 the service
+fired a `critical` popup claiming `10.3.153.246 is flooding udp/5355`, where
+`10.3.153.246` is this machine and `udp/5355` is systemd-resolved's own LLMNR
+query looping back. Over the preceding 24 hours, 50 of 426 drop records were one
+of these two cases and none of the 50 could have meant anything.
+
+The filters are structural rather than a port list, which is why `ignore_ports`
+defaults to empty and should usually stay that way. Note that they overlap on
+purpose: this host's IPv6 LLMNR queries are caught as self-sourced while its
+link-local address is assigned, and as group-addressed regardless.
+
+`--replay` prints what it discarded and why, so a quiet result always reads as
+"these were filtered on purpose" rather than as an unexplained absence.
 
 ## Install
 
@@ -76,7 +115,12 @@ log records. Counts indicate persistence, not volume.
 at startup only; restart the service after editing.
 
 Defaults: 1 Mbps inbound floor, 5% asymmetry ratio held for 60s, 4 drop records
-spanning 2 minutes, 30-minute cooldown per subject.
+spanning 2 minutes, 30-minute cooldown per subject, no ignored ports.
+
+`ignore_ports` takes a comma-separated list and is parsed all-or-nothing — a
+typo in one entry keeps the default rather than silently widening the blind
+spot. Prefer leaving it empty; if a port is noisy, the reason is usually
+something the structural filters above should be catching instead.
 
 Pointing `log_path` outside `~/.local/state/netwatch` requires relaxing
 `ProtectHome=` in the unit.

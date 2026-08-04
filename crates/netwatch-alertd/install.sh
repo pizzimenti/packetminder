@@ -48,6 +48,12 @@ if [[ ! -f "$config_dir/alertd.conf" ]]; then
 # block_min_events = 4
 # block_window_secs = 900
 # block_min_span_secs = 120
+#
+# Destination ports to discard outright. Usually unnecessary and best left
+# empty: drops this host sent itself, and drops addressed to a multicast or
+# broadcast group, are already filtered structurally. Parsed all-or-nothing,
+# so a typo keeps the default rather than widening the blind spot.
+# ignore_ports = 5355, 5353
 
 # -- Output --
 # cooldown_secs = 1800

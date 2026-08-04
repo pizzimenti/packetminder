@@ -7,12 +7,13 @@
 // =============================================================================
 
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::Write as _,
     net::Ipv4Addr,
     process::{Command, Stdio},
-    sync::mpsc::channel,
+    sync::{Mutex, OnceLock, mpsc::channel},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -96,32 +97,77 @@ fn notify(alert: &Alert) {
 
 // -- Source Enrichment --------------------------------------------------------
 
-/// Describe a remote address well enough to recognise it in a popup.
+/// How long a resolved — or unresolved — name is reused before asking again.
+/// Long enough that a 10-second tick never re-runs `getent`, short enough that
+/// a DHCP reassignment stops being attributed to the address's previous holder.
+const NAME_TTL_SECS: i64 = 300;
+
+type NameCache = Mutex<HashMap<String, (Option<String>, i64)>>;
+
+fn name_cache() -> &'static NameCache {
+    static CACHE: OnceLock<NameCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Name an address the way a human recognises it — `caldera.lan (10.3.59.7)` —
+/// falling back to the bare address when nothing resolves.
 ///
-/// Public addresses get a whois org name; LAN addresses get whatever reverse
-/// DNS and the neighbour table know, since whois has nothing useful to say
-/// about 10.0.0.0/8.
+/// The address is always kept alongside the name. A name alone is ambiguous
+/// after a DHCP reshuffle, and the address is what you need to write a firewall
+/// rule or start a capture.
+pub fn host_label(ip: &str) -> String {
+    match hostname_for(ip) {
+        Some(name) => format!("{name} ({ip})"),
+        None => ip.to_string(),
+    }
+}
+
+/// Cached reverse lookup.
+///
+/// Resolution goes through `getent hosts`, so it uses whatever nsswitch is
+/// configured with — which on a desktop includes mDNS and systemd-resolved's
+/// cache, not just unicast PTR. That is what makes LAN peers resolvable at all,
+/// since a home router rarely serves PTR records for its DHCP leases.
+///
+/// Negative results are cached too: a LAN without reverse records would
+/// otherwise pay the full lookup timeout on every single tick.
+pub fn hostname_for(ip: &str) -> Option<String> {
+    let now = now_epoch();
+
+    if let Ok(cache) = name_cache().lock()
+        && let Some((name, at)) = cache.get(ip)
+        && now - at < NAME_TTL_SECS
+    {
+        return name.clone();
+    }
+
+    let name = reverse_dns(ip);
+    if let Ok(mut cache) = name_cache().lock() {
+        cache.insert(ip.to_string(), (name.clone(), now));
+    }
+    name
+}
+
+/// Context for a source address beyond its name: which network it sits on, and
+/// who operates it. The name itself is already in the alert title.
 pub fn describe_source(ip: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    if let Some(name) = reverse_dns(ip) {
-        parts.push(name);
-    }
-
     if is_private(ip) {
+        // whois has nothing useful to say about 10.0.0.0/8, but the neighbour
+        // table does — a MAC identifies the device even after its lease moves.
         parts.push("LAN".to_string());
         if let Some(mac) = neighbour_mac(ip) {
             parts.push(mac);
         }
-    } else if let Some(isp) = whois_org(ip, 5) {
-        parts.push(isp);
+    } else {
+        parts.push("internet".to_string());
+        if let Some(isp) = whois_org(ip, 5) {
+            parts.push(isp);
+        }
     }
 
-    if parts.is_empty() {
-        "unknown".to_string()
-    } else {
-        parts.join(", ")
-    }
+    parts.join(", ")
 }
 
 /// True for RFC1918, CGNAT, link-local and loopback space.
@@ -140,17 +186,25 @@ pub fn is_private(ip: &str) -> bool {
 }
 
 fn reverse_dns(ip: &str) -> Option<String> {
-    let out = Command::new("getent").args(["hosts", ip]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let name = text.split_whitespace().nth(1)?;
-    if name.is_empty() || name == ip {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    let query = ip.to_string();
+    with_timeout(2, move || {
+        let out = Command::new("getent")
+            .args(["hosts", &query])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // Output is "<address> <canonical name> [aliases…]".
+        let text = String::from_utf8_lossy(&out.stdout);
+        let name = text.split_whitespace().nth(1)?;
+        if name.is_empty() || name == query {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    })
+    .flatten()
 }
 
 fn neighbour_mac(ip: &str) -> Option<String> {
@@ -165,42 +219,49 @@ fn neighbour_mac(ip: &str) -> Option<String> {
     None
 }
 
-/// Run `whois` with a hard timeout — it talks to the network and can hang.
 fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
-    let (tx, rx) = channel();
     let query = ip.to_string();
-    thread::spawn(move || {
-        let org = Command::new("whois")
+    with_timeout(timeout_secs, move || {
+        let text = Command::new("whois")
             .arg(&query)
             .output()
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .and_then(|text| {
-                for prefix in [
-                    "OrgName:",
-                    "org-name:",
-                    "netname:",
-                    "descr:",
-                    "Organization:",
-                ] {
-                    for line in text.lines() {
-                        if let Some(rest) = line.trim().strip_prefix(prefix) {
-                            let name = rest.trim();
-                            if !name.is_empty() {
-                                return Some(name.to_string());
-                            }
-                        }
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())?;
+
+        for prefix in [
+            "OrgName:",
+            "org-name:",
+            "netname:",
+            "descr:",
+            "Organization:",
+        ] {
+            for line in text.lines() {
+                if let Some(rest) = line.trim().strip_prefix(prefix) {
+                    let name = rest.trim();
+                    if !name.is_empty() {
+                        return Some(name.to_string());
                     }
                 }
-                None
-            });
-        // The receiver is gone on timeout; that is expected, not an error.
-        let _ = tx.send(org);
-    });
+            }
+        }
+        None
+    })
+    .flatten()
+}
 
-    rx.recv_timeout(Duration::from_secs(timeout_secs))
-        .ok()
-        .flatten()
+/// Run `f` on a helper thread, giving up after `secs`.
+///
+/// Every enrichment lookup shells out either to something that talks to the
+/// network (`whois`) or to a resolver that may itself be waiting on the network
+/// (`getent`). Neither may be allowed to stall the detector loop, and on this
+/// host the resolver stalling is exactly the condition being investigated.
+fn with_timeout<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        // The receiver is gone on timeout; that is expected, not an error.
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(secs)).ok()
 }
 
 // -- Local Socket Lookup ------------------------------------------------------
@@ -244,6 +305,23 @@ pub fn fmt_bits(bps: f64) -> String {
         format!("{:.1} Kbps", bps / 1_000.0)
     } else {
         format!("{bps:.0} bps")
+    }
+}
+
+/// Format a byte count. Binary units, because this is memory-of-the-wire, not
+/// marketing.
+pub fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
