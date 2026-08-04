@@ -331,7 +331,7 @@ impl FlowTracker {
             }
 
             state.alerted_at = Some(now);
-            alerts.push(build_alert(key, state, now));
+            alerts.push(build_alert(key, state, now, &self.local));
         }
 
         for key in finished {
@@ -371,10 +371,17 @@ impl FlowTracker {
     }
 }
 
-fn build_alert(key: &FlowKey, state: &FlowState, now: i64) -> Alert {
+fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> Alert {
     let proto = key.proto.to_lowercase();
     let duration = fmt_duration((now - state.first).max(0) as u64);
     let listening = port_in_use(&key.proto, key.dport);
+
+    // "Not the internet" is two conditions, and both are needed. On a subnet
+    // this host is attached to is the only one that means anything under IPv6.
+    // Private v4 space is the fallback: it still holds when address discovery
+    // has failed, and it covers a LAN host reached through a router.
+    let nearby =
+        parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(&key.src);
 
     let mut body = format!(
         "{} drops ({}) logged over {} on {}, still going.\n\
@@ -399,7 +406,7 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64) -> Alert {
         ));
     }
 
-    body.push_str(&format!("Source: {}", describe_source(&key.src)));
+    body.push_str(&format!("Source: {}", describe_source(&key.src, nearby)));
     if state.sport != 0 {
         body.push_str(&format!(" from {proto}/{}", state.sport));
     }
@@ -409,11 +416,7 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64) -> Alert {
     // transmitting into a black hole are both somebody's mistake worth waking
     // up for. The internet knocking on a closed port all day is just the
     // internet, and does not get to interrupt anyone.
-    let urgency = if listening || is_private(&key.src) {
-        "critical"
-    } else {
-        "normal"
-    };
+    let urgency = if listening || nearby { "critical" } else { "normal" };
 
     Alert {
         kind: "blocked-flow",
@@ -504,7 +507,7 @@ mod tests {
     /// A tracker that believes it owns this machine's addresses, so tests never
     /// depend on whatever the host running them actually has configured.
     fn tracker() -> FlowTracker {
-        FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246"], &["10.3.255.255"]))
+        FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246/16"], &["10.3.255.255"]))
     }
 
     #[test]

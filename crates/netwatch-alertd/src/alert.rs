@@ -150,11 +150,16 @@ pub fn hostname_for(ip: &str) -> Option<String> {
 
 /// Context for a source address beyond its name: which network it sits on, and
 /// who operates it. The name itself is already in the alert title.
-pub fn describe_source(ip: &str) -> String {
+///
+/// `nearby` must come from `LocalNet::is_on_link`, not from the address class.
+/// Asking whois about a neighbour returns a confident, correct, and thoroughly
+/// misleading answer — it names whoever owns the allocation, so a machine on
+/// the same switch gets reported as an ISP on the far side of the internet.
+pub fn describe_source(ip: &str, nearby: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    if is_private(ip) {
-        // whois has nothing useful to say about 10.0.0.0/8, but the neighbour
+    if nearby {
+        // whois has nothing useful to say about a neighbour, but the neighbour
         // table does — a MAC identifies the device even after its lease moves.
         parts.push("LAN".to_string());
         if let Some(mac) = neighbour_mac(ip) {

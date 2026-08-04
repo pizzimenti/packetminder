@@ -45,6 +45,22 @@ after a DHCP reshuffle, and the address is what you need in order to write a
 firewall rule or start a capture. Results are cached for 5 minutes, negatives
 included, so a LAN without reverse records does not pay a lookup on every tick.
 
+Whether a source is a neighbour or a stranger is decided by **whether it shares
+a prefix with one of this host's own addresses**, not by its address class.
+Under IPv4 the two agree, because RFC1918 space is not routable. Under IPv6 they
+do not: there is no NAT, so the machine on the next desk holds a globally
+routable address, and asking whois about it returns a confident, correct, and
+completely misleading answer naming whoever owns the allocation.
+
+This is not hypothetical either. The `udp/41641` Tailscale drops below came from
+`2605:59ca:3307:0c08:8255:…` and were reported as `internet, SpaceX Services,
+Inc.` — while this host held `2605:59ca:3307:0c08:0db3:…` on the same /64. ufw
+was forcing a DERP relay between two machines on the same switch, and the alert
+described one of them as being on the far side of the internet.
+
+Private v4 space is still consulted as a fallback, so a LAN host reached through
+a router is classified correctly, and so is everything if `ip addr` fails.
+
 A `blocked-flow` alert distinguishes two very different situations:
 
 - **Nothing listening** — someone is transmitting into the void. Tonight's case.
@@ -81,6 +97,14 @@ link-local address is assigned, and as group-addressed regardless.
 
 `--replay` prints what it discarded and why, so a quiet result always reads as
 "these were filtered on purpose" rather than as an unexplained absence.
+
+One caveat, since it has now caused a wrong conclusion twice: **every judgement
+that depends on this host's addresses is made against the addresses it has
+right now.** The journal does not record what they were at the time. On a
+machine whose interfaces flap — or whose IPv6 gets disabled between the event
+and the replay — a historical record can be classified against an address set
+that no longer resembles the one it arrived under. Live operation re-reads every
+60 seconds and is fine; `--replay` cannot be.
 
 ## Install
 
