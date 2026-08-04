@@ -31,7 +31,11 @@ pub struct Alert {
     /// Stable dedup key; repeat alerts with the same key replace the popup.
     pub key: String,
     pub title: String,
+    /// Short enough for a popup. Two lines is the budget: notification daemons
+    /// scroll or clip anything longer, and the clipped part is invisible.
     pub body: String,
+    /// Context worth keeping but not worth interrupting for. Journal only.
+    pub detail: String,
     /// "low" | "normal" | "critical"
     pub urgency: &'static str,
 }
@@ -39,8 +43,20 @@ pub struct Alert {
 // -- Emitting -----------------------------------------------------------------
 
 pub fn emit(cfg: &Config, alert: &Alert) {
-    let flat = alert.body.replace('\n', " | ");
-    log(&format!("{} — {} | {}", alert.kind, alert.title, flat));
+    // The journal gets everything; the popup gets only `body`. Splitting them
+    // is the whole point -- a notification that has to be scrolled has already
+    // failed, but the context is still worth keeping somewhere.
+    let mut line = format!(
+        "{} — {} | {}",
+        alert.kind,
+        alert.title,
+        alert.body.replace('\n', " | ")
+    );
+    if !alert.detail.is_empty() {
+        line.push_str(" | ");
+        line.push_str(&alert.detail.replace('\n', " | "));
+    }
+    log(&line);
 
     if cfg.notify {
         notify(alert);
@@ -96,17 +112,135 @@ fn name_cache() -> &'static NameCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Name an address the way a human recognises it — `caldera.lan (10.3.59.7)` —
-/// falling back to the bare address when nothing resolves.
+/// OUI → vendor, cached with no expiry. The IEEE assignment behind a MAC
+/// prefix does not change, so unlike a DHCP name this never goes stale.
+/// Negative results are cached too, so an unregistered prefix costs one lookup.
+type VendorCache = Mutex<HashMap<String, Option<String>>>;
+
+fn vendor_cache() -> &'static VendorCache {
+    static CACHE: OnceLock<VendorCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Name a device the way its owner would recognise it — `Roku (10.3.193.195)`,
+/// `caldera.lan (10.3.59.7)` — falling back to the bare address.
+///
+/// Prefers a hostname a person plausibly chose, and the vendor behind the MAC
+/// when it is obviously machine-generated. Consumer hardware publishes mDNS
+/// names like `X01000EKSRNP.local`, which identifies nothing and is worse than
+/// useless in a popup you have two seconds to read. "Roku" identifies it
+/// instantly, and it is the same answer whether or not mDNS resolved at all.
 ///
 /// The address is always kept alongside the name. A name alone is ambiguous
 /// after a DHCP reshuffle, and the address is what you need to write a firewall
 /// rule or start a capture.
-pub fn host_label(ip: &str) -> String {
-    match hostname_for(ip) {
-        Some(name) => format!("{name} ({ip})"),
-        None => ip.to_string(),
+pub fn device_label(ip: &str) -> String {
+    let named = hostname_for(ip);
+    let short = named
+        .as_deref()
+        .and_then(|n| n.split('.').next())
+        .filter(|n| !n.is_empty());
+
+    if let Some(name) = short
+        && !looks_machine_generated(name)
+    {
+        return format!("{name} ({ip})");
     }
+
+    match vendor_for(ip) {
+        Some(vendor) => format!("{vendor} ({ip})"),
+        // No vendor to fall back on, so a serial beats nothing.
+        None => match short {
+            Some(name) => format!("{name} ({ip})"),
+            None => ip.to_string(),
+        },
+    }
+}
+
+/// True for names no human picked: `X01000EKSRNP`, `AC233FA1B2C3`. Shouting
+/// alphanumerics of identifier length, with no lowercase anywhere.
+fn looks_machine_generated(label: &str) -> bool {
+    label.len() >= 8
+        && label.chars().any(|c| c.is_ascii_digit())
+        && !label.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// Vendor behind an address's MAC, via the neighbour table and systemd's hwdb.
+///
+/// hwdb ships the IEEE OUI registry pre-compiled, so this stays a local lookup
+/// with no network call and no new dependency — the same bargain the rest of
+/// this module strikes with `getent` and `ip`.
+pub fn vendor_for(ip: &str) -> Option<String> {
+    let mac = neighbour_mac(ip)?;
+    let oui: String = mac
+        .split(':')
+        .take(3)
+        .flat_map(|b| b.chars())
+        .collect::<String>()
+        .to_uppercase();
+    if oui.len() != 6 {
+        return None;
+    }
+
+    if let Ok(cache) = vendor_cache().lock()
+        && let Some(hit) = cache.get(&oui)
+    {
+        return hit.clone();
+    }
+
+    let found = hwdb_oui(&oui).map(|raw| tidy_vendor(&raw));
+    if let Ok(mut cache) = vendor_cache().lock() {
+        cache.insert(oui, found.clone());
+    }
+    found
+}
+
+fn hwdb_oui(oui: &str) -> Option<String> {
+    let out = Command::new("systemd-hwdb")
+        .args(["query", &format!("OUI:{oui}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.strip_prefix("ID_OUI_FROM_DATABASE="))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// "Roku, Inc" → "Roku". The registry is full of legal boilerplate that costs
+/// popup width and tells you nothing about which box on the shelf it is.
+fn tidy_vendor(raw: &str) -> String {
+    let head = raw.split(',').next().unwrap_or(raw).trim();
+    let mut best = head;
+    // Legal suffixes first, descriptor words second. One pass, so the order is
+    // the behaviour: strip "Inc" before "Technologies" or "Amazon Technologies
+    // Inc" keeps the word that carries no information.
+    for suffix in [
+        " Inc.",
+        " Inc",
+        " Ltd.",
+        " Ltd",
+        " LLC",
+        " GmbH",
+        " B.V.",
+        " Co.",
+        " Co",
+        " Corporation",
+        " Corporate",
+        " Company",
+        " Technologies",
+        " Technology",
+        " Electronics",
+        " Systems",
+    ] {
+        if let Some(stripped) = best.strip_suffix(suffix)
+            && !stripped.trim().is_empty()
+        {
+            best = stripped.trim_end();
+        }
+    }
+    if best.is_empty() { raw.to_string() } else { best.to_string() }
 }
 
 /// Cached reverse lookup.
@@ -394,4 +528,42 @@ pub fn fmt_iso_local(epoch: i64) -> String {
         tm.tm_min,
         tm.tm_sec
     )
+}
+
+// -- Tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serial_names_are_told_apart_from_chosen_ones() {
+        // The whole point: a Roku's mDNS name identifies nothing.
+        assert!(looks_machine_generated("X01000EKSRNP"));
+        assert!(looks_machine_generated("AC233FA1B2C3"));
+
+        // Names a person picked, in the shapes people actually pick them.
+        assert!(!looks_machine_generated("caldera"));
+        assert!(!looks_machine_generated("ithilien"));
+        assert!(!looks_machine_generated("Living-Room-TV"));
+        assert!(!looks_machine_generated("nas2"));
+
+        // Short and shouty is ambiguous, so it is left alone rather than
+        // guessed at -- a hostname beats no hostname.
+        assert!(!looks_machine_generated("NAS"));
+        assert!(!looks_machine_generated("ROUTER"));
+    }
+
+    #[test]
+    fn vendor_names_lose_their_legal_boilerplate() {
+        assert_eq!(tidy_vendor("Roku, Inc"), "Roku");
+        assert_eq!(tidy_vendor("Cisco Systems, Inc"), "Cisco");
+        assert_eq!(tidy_vendor("Intel Corporate"), "Intel");
+        assert_eq!(tidy_vendor("Amazon Technologies Inc"), "Amazon");
+        assert_eq!(tidy_vendor("Nintendo Co., Ltd"), "Nintendo");
+
+        // Nothing to strip, and nothing that strips down to nothing.
+        assert_eq!(tidy_vendor("Google"), "Google");
+        assert_eq!(tidy_vendor("Inc"), "Inc");
+    }
 }

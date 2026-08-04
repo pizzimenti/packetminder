@@ -28,7 +28,7 @@ use std::{
 
 use crate::{
     alert::{
-        self, Alert, describe_source, fmt_bytes, fmt_duration, host_label, is_private, now_epoch,
+        self, Alert, describe_source, device_label, fmt_bytes, fmt_duration, is_private, now_epoch,
         port_in_use,
     },
     config::Config,
@@ -318,7 +318,7 @@ impl FlowTracker {
                         alert::log(
                             &format!(
                                 "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
-                                host_label(&key.src),
+                                device_label(&key.src),
                                 key.proto.to_lowercase(),
                                 key.dport,
                                 fmt_duration((state.last - state.first).max(0) as u64),
@@ -376,7 +376,7 @@ impl FlowTracker {
             .map(|(k, s)| {
                 format!(
                     "{} → {}/{} ({} drops)",
-                    host_label(&k.src),
+                    device_label(&k.src),
                     k.proto.to_lowercase(),
                     k.dport,
                     s.times.len()
@@ -400,32 +400,34 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     let nearby =
         parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(&key.src);
 
+    // Two lines, both of which answer a question you would actually ask: how
+    // long has this been happening, and does anything here want the traffic.
     let mut body = format!(
-        "{} drops ({}) logged over {} on {}, still going.\n\
-         ufw rate-limits its own logging, so that measures persistence, not volume.\n",
-        state.total,
-        fmt_bytes(state.bytes),
-        duration,
-        state.iface,
+        "{} drops over {} on {}, still going.\n",
+        state.total, duration, state.iface,
     );
-
     if listening {
         body.push_str(&format!(
-            "Something IS listening on {proto}/{} — the firewall is blocking traffic \
-             a local service wants. Allow it, or stop the sender.\n",
+            "Something IS listening on {proto}/{} — the firewall is blocking it.",
             key.dport
         ));
     } else {
-        body.push_str(&format!(
-            "Nothing is listening on {proto}/{}. The sender is getting no feedback \
-             because the drop is silent.\n",
-            key.dport
-        ));
+        body.push_str(&format!("Nothing is listening on {proto}/{}.", key.dport));
     }
 
-    body.push_str(&format!("Source: {}", describe_source(&key.src, nearby)));
+    // Everything below is true and occasionally useful, and none of it is worth
+    // making the popup unreadable for.
+    let mut detail = format!(
+        "{} logged. ufw rate-limits its own logging, so the count measures \
+         persistence, not volume.",
+        fmt_bytes(state.bytes),
+    );
+    if !listening {
+        detail.push_str(" The sender is getting no feedback because the drop is silent.");
+    }
+    detail.push_str(&format!(" Source: {}", describe_source(&key.src, nearby)));
     if state.sport != 0 {
-        body.push_str(&format!(" from {proto}/{}", state.sport));
+        detail.push_str(&format!(" from {proto}/{}", state.sport));
     }
 
     // Volume cannot be read off a rate-limited log, so urgency comes from what
@@ -442,10 +444,11 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
         key: format!("flow-{}-{}-{}", key.src, proto, key.dport),
         title: format!(
             "{} keeps hitting blocked {proto}/{}",
-            host_label(&key.src),
+            device_label(&key.src),
             key.dport
         ),
         body,
+        detail,
         urgency,
     }
 }

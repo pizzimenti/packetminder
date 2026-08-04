@@ -190,21 +190,19 @@ fn build_alert(key: &SelfKey, state: &SelfState, cfg: &Config, now: i64) -> Aler
     let proto = key.proto.to_lowercase();
     let duration = fmt_duration((now - state.first).max(0) as u64);
 
-    let (title, body, urgency) = if state.unicast {
+    let (title, body, detail, urgency) = if state.unicast {
         (
             format!("This host is sending blocked traffic to {}", key.dst),
             format!(
-                "{} drops ({}) over {} on {}, addressed to one host rather than to a group.\n\
-                 Traffic this host sent should not be arriving on its own input path unless \
-                 something is looping it back: a routing loop, a misconfigured tunnel, or a \
-                 spoofed source address.\n\
-                 Destination {}/{}.",
-                state.total,
+                "{} drops over {} on {}, to {}/{}.\n\
+                 Addressed to one host rather than to a group.",
+                state.total, duration, state.iface, proto, key.dport,
+            ),
+            format!(
+                "{} logged. Traffic this host sent should not be arriving on its own \
+                 input path unless something is looping it back: a routing loop, a \
+                 misconfigured tunnel, or a spoofed source address.",
                 fmt_bytes(state.bytes),
-                duration,
-                state.iface,
-                proto,
-                key.dport,
             ),
             "critical",
         )
@@ -212,16 +210,19 @@ fn build_alert(key: &SelfKey, state: &SelfState, cfg: &Config, now: i64) -> Aler
         (
             format!("This host's own {proto}/{} traffic is blocked", key.dport),
             format!(
-                "Active in {} of the last {} minutes on {} ({} drops, {}).\n\
-                 The firewall is dropping multicast this host sends to {}. Nothing external \
-                 is involved — allow it, or stop whatever keeps sending it.\n\
-                 Inbound replies to {proto}/{} take the same path, so they are being dropped too.",
+                "Active in {} of the last {} minutes on {}.\n\
+                 The firewall is dropping multicast this host sends to {}.",
                 state.minutes.len(),
                 cfg.self_window_secs / 60,
                 state.iface,
+                key.dst,
+            ),
+            format!(
+                "{} drops, {}. Nothing external is involved — allow it, or stop whatever \
+                 keeps sending it. Inbound replies to {proto}/{} take the same path, so \
+                 they are being dropped too.",
                 state.total,
                 fmt_bytes(state.bytes),
-                key.dst,
                 key.dport,
             ),
             "normal",
@@ -233,6 +234,7 @@ fn build_alert(key: &SelfKey, state: &SelfState, cfg: &Config, now: i64) -> Aler
         key: format!("self-{}-{}-{}", key.dst, proto, key.dport),
         title,
         body,
+        detail,
         urgency,
     }
 }

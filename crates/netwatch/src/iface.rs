@@ -159,8 +159,8 @@ fn build_alert(
         0.0
     };
 
-    let mut body = format!(
-        "Receiving {} but sending only {} ({:.1}% of inbound) for {}.\n\
+    let body = format!(
+        "Receiving {}, sending only {} ({:.1}%) for {}.\n\
          Nothing on this host appears to be answering it.",
         fmt_bits(rx_bps),
         fmt_bits(tx_bps),
@@ -168,18 +168,21 @@ fn build_alert(
         fmt_duration(held_secs),
     );
 
-    match hint {
-        Some(h) => body.push_str(&format!("\nFirewall is dropping: {h}")),
-        None => body.push_str(&format!(
-            "\nTo identify it: sudo tcpdump -i {iface} -nn -c 200"
-        )),
-    }
+    // Drops that happen to overlap this window are evidence, not a cause. A
+    // handful of dropped UDP packets cannot account for megabits per second,
+    // and putting the two side by side in a popup invites exactly that reading.
+    // Say "concurrent" and keep it out of the two lines a human actually reads.
+    let detail = match hint {
+        Some(h) => format!("Concurrent firewall drops, which may be unrelated: {h}"),
+        None => format!("To identify it: sudo tcpdump -i {iface} -nn -c 200"),
+    };
 
     Alert {
         kind: "asymmetric-inbound",
         key: format!("asym-{iface}"),
         title: format!("Unanswered inbound traffic on {iface}"),
         body,
+        detail,
         urgency: "critical",
     }
 }

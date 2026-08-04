@@ -168,13 +168,14 @@ fn check_ipv6(seen: &mut HashSet<IpAddr>) -> Option<Alert> {
         key: "ipv6-active".to_string(),
         title: "IPv6 addressing became active".to_string(),
         body: format!(
-            "New IPv6 address(es): {}.\n\
-             Something enabled IPv6 on an interface that did not have it. Where IPv6 is meant \
-             to stay off, the usual cause is NetworkManager rather than the kernel: a profile \
-             with ipv6.method=auto clears disable_ipv6 for its own interface, which overrides \
-             anything set in /etc/sysctl.d.",
+            "New address(es): {}.\n\
+             Something enabled IPv6 on an interface that did not have it.",
             appeared.join(", ")
         ),
+        detail: "Where IPv6 is meant to stay off, the usual cause is NetworkManager rather \
+                 than the kernel: a profile with ipv6.method=auto clears disable_ipv6 for its \
+                 own interface, which overrides anything set in /etc/sysctl.d."
+            .to_string(),
         urgency: "normal",
     })
 }
@@ -305,8 +306,8 @@ fn selftest(cfg: Config) {
         kind: "selftest",
         key: "selftest".to_string(),
         title: "netwatch selftest".to_string(),
-        body: "If you can read this, notifications and the event log both work."
-            .to_string(),
+        body: "If you can read this, notifications work.".to_string(),
+        detail: "Emitted by --selftest, not by a detector.".to_string(),
         urgency: "normal",
     };
     alert::emit(&cfg, &a);
