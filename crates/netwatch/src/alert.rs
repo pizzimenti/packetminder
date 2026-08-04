@@ -208,39 +208,102 @@ fn hwdb_oui(oui: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// "Roku, Inc" → "Roku". The registry is full of legal boilerplate that costs
-/// popup width and tells you nothing about which box on the shelf it is.
+/// Boilerplate the IEEE registry carries that never says which box this is.
+/// Order does not matter — stripping repeats until it stops changing anything.
+const VENDOR_NOISE: [&str; 30] = [
+    " Inc.",
+    " Inc",
+    " Corp.",
+    " Corp",
+    " Corporation",
+    " Corporate",
+    " Company",
+    " Co.",
+    " Co",
+    " Ltd.",
+    " Ltd",
+    " Limited",
+    " LLC",
+    " L.L.C.",
+    " GmbH",
+    " AG",
+    " B.V.",
+    " N.V.",
+    " S.A.",
+    " PLC",
+    " Pte",
+    " Pty",
+    " Technologies",
+    " Technology",
+    " Electronics",
+    " Electronic",
+    " Systems",
+    " Networks",
+    " Solutions",
+    " Communications",
+];
+
+/// "Roku, Inc" → "Roku". "GL Technologies (Hong Kong) Limited" → "GL".
+///
+/// The registry is full of legal boilerplate, place-of-incorporation
+/// parentheticals and generic descriptors. None of it identifies the device,
+/// and all of it costs width in a popup budgeted at two lines.
 fn tidy_vendor(raw: &str) -> String {
-    let head = raw.split(',').next().unwrap_or(raw).trim();
-    let mut best = head;
-    // Legal suffixes first, descriptor words second. One pass, so the order is
-    // the behaviour: strip "Inc" before "Technologies" or "Amazon Technologies
-    // Inc" keeps the word that carries no information.
-    for suffix in [
-        " Inc.",
-        " Inc",
-        " Ltd.",
-        " Ltd",
-        " LLC",
-        " GmbH",
-        " B.V.",
-        " Co.",
-        " Co",
-        " Corporation",
-        " Corporate",
-        " Company",
-        " Technologies",
-        " Technology",
-        " Electronics",
-        " Systems",
-    ] {
-        if let Some(stripped) = best.strip_suffix(suffix)
-            && !stripped.trim().is_empty()
-        {
-            best = stripped.trim_end();
+    // "LCFC(Hefei) …" and "… (Hong Kong) Limited" both carry a parenthetical,
+    // and it is never the brand.
+    let mut unparenthesised = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for c in raw.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => unparenthesised.push(c),
+            _ => {}
         }
     }
-    if best.is_empty() { raw.to_string() } else { best.to_string() }
+
+    let head = unparenthesised
+        .split(',')
+        .next()
+        .unwrap_or(&unparenthesised)
+        .trim()
+        .to_string();
+    let mut best = head.as_str();
+
+    // Repeat until stable. "LCFC Electronics Technology co." has to shed three
+    // separate words, and a single pass strips only whichever the list reaches
+    // first. Bounded so a pathological name cannot spin.
+    for _ in 0..8 {
+        let before = best;
+        for suffix in VENDOR_NOISE {
+            if let Some(stripped) = strip_suffix_ci(best, suffix) {
+                let trimmed = stripped.trim_end();
+                // Never strip a name down to nothing: a vendor really called
+                // "Systems" keeps its name.
+                if !trimmed.is_empty() {
+                    best = trimmed;
+                }
+            }
+        }
+        if best == before {
+            break;
+        }
+    }
+
+    // Removing a parenthetical leaves a double space behind.
+    let out = best.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.is_empty() { raw.trim().to_string() } else { out }
+}
+
+/// `strip_suffix`, but case-insensitively — the registry writes "co., ltd" as
+/// often as "Co., Ltd".
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = s.len().checked_sub(suffix.len())?;
+    if !s.is_char_boundary(split) {
+        return None;
+    }
+    let (head, tail) = s.split_at(split);
+    tail.eq_ignore_ascii_case(suffix).then_some(head)
 }
 
 /// Cached reverse lookup.
@@ -561,6 +624,16 @@ mod tests {
         assert_eq!(tidy_vendor("Intel Corporate"), "Intel");
         assert_eq!(tidy_vendor("Amazon Technologies Inc"), "Amazon");
         assert_eq!(tidy_vendor("Nintendo Co., Ltd"), "Nintendo");
+
+        // Every one of these is on the LAN this was written for, and each broke
+        // an earlier version: a missing suffix, a lowercase one, a parenthetical.
+        assert_eq!(tidy_vendor("Dell Inc."), "Dell");
+        assert_eq!(tidy_vendor("TIBRO Corp."), "TIBRO");
+        assert_eq!(tidy_vendor("GL Technologies (Hong Kong) Limited"), "GL");
+        assert_eq!(
+            tidy_vendor("LCFC(Hefei) Electronics Technology co., ltd"),
+            "LCFC"
+        );
 
         // Nothing to strip, and nothing that strips down to nothing.
         assert_eq!(tidy_vendor("Google"), "Google");
