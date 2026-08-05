@@ -1,6 +1,6 @@
 [Unit]
-Description=Refresh netwatch's privileged counter snapshot
-Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
+Description=Refresh packetminder's privileged counter snapshot
+Documentation=file:%h/Code/packetminder/crates/packetminder/README.md
 
 [Timer]
 OnBootSec=15s

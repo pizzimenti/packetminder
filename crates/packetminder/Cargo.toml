@@ -1,16 +1,17 @@
 [package]
-name = "netwatch"
+name = "packetminder"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "netwatch"
+name = "packetminder"
 path = "src/main.rs"
 
 # Intentionally dependency-free. This runs as a long-lived user service parsing
 # input that hostile hosts influence, so the smaller its supply chain the better.
 #
-# It does not link netwatch-core either, though that is now a choice rather than
+# It does not link packetminder-core either, though that is now a choice rather than
 # a constraint: core used to be built with pyo3's `extension-module`, which left
 # libpython symbols undefined — fine for a cdylib, a link error for a binary.
 # The Python binding is gone and core is a plain rlib, so this could link it. It

@@ -16,20 +16,20 @@ fi
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Installing collector to /usr/local/libexec"
-install -Dm755 "$here/netwatch-collect" /usr/local/libexec/netwatch-collect
+install -Dm755 "$here/packetminder-collect" /usr/local/libexec/packetminder-collect
 
 echo "==> Installing units to /etc/systemd/system"
-install -Dm644 "$here/netwatch-collector.service" /etc/systemd/system/netwatch-collector.service
-install -Dm644 "$here/netwatch-collector.timer" /etc/systemd/system/netwatch-collector.timer
+install -Dm644 "$here/packetminder-collector.service" /etc/systemd/system/packetminder-collector.service
+install -Dm644 "$here/packetminder-collector.timer" /etc/systemd/system/packetminder-collector.timer
 
 # Without accounting every conntrack bytes= field reads zero, which silently
 # turns the QUIC corroboration this exists for into "nothing is consuming
 # anything". Cheap, but not free: the kernel maintains two extra counters per
 # tracked flow.
 echo "==> Enabling conntrack byte accounting"
-install -Dm644 /dev/stdin /etc/sysctl.d/99-netwatch-conntrack-acct.conf <<'EOF'
-# Required by netwatch-collector: without it /proc/net/nf_conntrack reports
-# bytes=0 for every flow, and netwatch cannot tell a consumed transfer from an
+install -Dm644 /dev/stdin /etc/sysctl.d/99-packetminder-conntrack-acct.conf <<'EOF'
+# Required by packetminder-collector: without it /proc/net/nf_conntrack reports
+# bytes=0 for every flow, and packetminder cannot tell a consumed transfer from an
 # unconsumed one over UDP.
 net.netfilter.nf_conntrack_acct = 1
 EOF
@@ -37,16 +37,16 @@ sysctl --quiet --system
 
 echo "==> Starting timer"
 systemctl daemon-reload
-systemctl enable --now netwatch-collector.timer >/dev/null
-systemctl start netwatch-collector.service
+systemctl enable --now packetminder-collector.timer >/dev/null
+systemctl start packetminder-collector.service
 
 echo
 echo "Snapshot:"
-sed 's/^/  /' /run/netwatch/snapshot 2>/dev/null || echo "  (not written yet)"
+sed 's/^/  /' /run/packetminder/snapshot 2>/dev/null || echo "  (not written yet)"
 echo
 echo "To remove:"
-echo "  systemctl disable --now netwatch-collector.timer"
-echo "  rm /etc/systemd/system/netwatch-collector.{service,timer}"
-echo "  rm /usr/local/libexec/netwatch-collect"
-echo "  rm /etc/sysctl.d/99-netwatch-conntrack-acct.conf"
+echo "  systemctl disable --now packetminder-collector.timer"
+echo "  rm /etc/systemd/system/packetminder-collector.{service,timer}"
+echo "  rm /usr/local/libexec/packetminder-collect"
+echo "  rm /etc/sysctl.d/99-packetminder-conntrack-acct.conf"
 echo "  systemctl daemon-reload"

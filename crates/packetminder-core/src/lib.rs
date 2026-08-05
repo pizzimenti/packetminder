@@ -1,5 +1,5 @@
 // =============================================================================
-// netwatch-core — Business logic for monitoring active TCP connections.
+// packetminder-core — Business logic for monitoring active TCP connections.
 //
 // Provides connection polling (via `ss`), whois ISP lookups, speed tracking,
 // and formatting helpers. Used by both the TUI and Qt GUI frontends.

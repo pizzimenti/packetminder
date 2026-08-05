@@ -1,7 +1,7 @@
 // =============================================================================
-// netwatch-tui — Terminal UI for monitoring active TCP connections in real time.
+// packetminder-tui — Terminal UI for monitoring active TCP connections in real time.
 //
-// This is a thin display layer on top of netwatch-core, which handles all
+// This is a thin display layer on top of packetminder-core, which handles all
 // polling, parsing, whois lookups, and connection tracking.
 // =============================================================================
 
@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use netwatch_core::{
+use packetminder_core::{
     fmt_bytes, fmt_speed, fmt_time, row_color, App, Conn, COL_COUNT, COL_LABELS, POLL_INTERVAL,
 };
 
@@ -60,7 +60,7 @@ fn draw(f: &mut Frame, app: &App, table_state: &mut TableState) {
     let count_str = format!(" {} connections ", count);
     let title = Line::from(vec![
         Span::styled(
-            " NETWATCH ",
+            " PACKETMINDER ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(&count_str, Style::default().fg(Color::Yellow)),

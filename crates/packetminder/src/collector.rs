@@ -15,13 +15,13 @@
 //                          rate limited to 3/min and therefore counts its own
 //                          limiter rather than the traffic.
 //
-// See collector/netwatch-collect for why the privileged side is a 60-line
+// See collector/packetminder-collect for why the privileged side is a 60-line
 // script rather than part of this binary.
 // =============================================================================
 
 use std::fs;
 
-pub const SNAPSHOT_PATH: &str = "/run/netwatch/snapshot";
+pub const SNAPSHOT_PATH: &str = "/run/packetminder/snapshot";
 
 // -- Data Structures ----------------------------------------------------------
 

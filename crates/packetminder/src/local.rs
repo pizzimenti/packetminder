@@ -162,7 +162,7 @@ fn read_addrs() -> Addrs {
     let mut have = Addrs::default();
 
     let Ok(out) = Command::new("ip").args(["-o", "addr", "show"]).output() else {
-        eprintln!("netwatch: cannot run `ip addr`; self-sourced drops will not be filtered");
+        eprintln!("packetminder: cannot run `ip addr`; self-sourced drops will not be filtered");
         return have;
     };
 

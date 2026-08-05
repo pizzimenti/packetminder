@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build netwatch and install it as a systemd user service.
+# Build packetminder and install it as a systemd user service.
 #
 # Safe to re-run: it rebuilds, reinstalls, and restarts, which is how you pick
 # up code or unit changes.
@@ -11,29 +11,29 @@ repo_dir="$(cd "$crate_dir/../.." && pwd)"
 
 bin_dir="$HOME/.local/bin"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/netwatch"
-unit_name="netwatch.service"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/packetminder"
+unit_name="packetminder.service"
 
 echo "==> Building (release)"
-# The TUI comes too: an alert's "Open netwatch" button launches it, and a
+# The TUI comes too: an alert's "Open packetminder" button launches it, and a
 # button that cannot work is worse than no button.
-cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p netwatch -p netwatch-tui
+cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p packetminder -p packetminder-tui
 
 echo "==> Installing binaries to $bin_dir"
-install -Dm755 "$repo_dir/target/release/netwatch" "$bin_dir/netwatch"
-install -Dm755 "$repo_dir/target/release/netwatch-tui" "$bin_dir/netwatch-tui"
+install -Dm755 "$repo_dir/target/release/packetminder" "$bin_dir/packetminder"
+install -Dm755 "$repo_dir/target/release/packetminder-tui" "$bin_dir/packetminder-tui"
 
 echo "==> Installing unit to $unit_dir"
 install -Dm644 "$crate_dir/$unit_name" "$unit_dir/$unit_name"
 
 # Never clobber a config the user has tuned.
-if [[ ! -f "$config_dir/netwatch.conf" ]]; then
-    echo "==> Writing default config to $config_dir/netwatch.conf"
+if [[ ! -f "$config_dir/packetminder.conf" ]]; then
+    echo "==> Writing default config to $config_dir/packetminder.conf"
     install -d "$config_dir"
-    cat >"$config_dir/netwatch.conf" <<'EOF'
-# netwatch configuration. Every key is optional.
+    cat >"$config_dir/packetminder.conf" <<'EOF'
+# packetminder configuration. Every key is optional.
 # Re-read at start only: restart the service after editing.
-#   systemctl --user restart netwatch
+#   systemctl --user restart packetminder
 
 # -- Sampling --
 # interval_secs = 10
@@ -109,13 +109,13 @@ if [[ ! -f "$config_dir/netwatch.conf" ]]; then
 # cooldown_secs = 1800
 # notify = true
 #
-# Alerts carry an "Open netwatch" button that launches the TUI. Left empty this
-# finds a terminal emulator and runs netwatch-tui in it. Set an explicit command
+# Alerts carry an "Open packetminder" button that launches the TUI. Left empty this
+# finds a terminal emulator and runs packetminder-tui in it. Set an explicit command
 # to override, or "off" to drop the button. Split on whitespace, not a shell.
-# tui_command = konsole -e netwatch-tui
+# tui_command = konsole -e packetminder-tui
 EOF
 else
-    echo "==> Keeping existing config at $config_dir/netwatch.conf"
+    echo "==> Keeping existing config at $config_dir/packetminder.conf"
 fi
 
 echo "==> Verifying unit"
@@ -131,8 +131,8 @@ echo
 systemctl --user --no-pager --lines=0 status "$unit_name" || true
 echo
 echo "Installed. Useful commands:"
-echo "  systemctl --user status netwatch"
-echo "  journalctl --user -u netwatch -f"
-echo "  netwatch --status          # one interface sample"
-echo "  netwatch --replay -24h     # what would have alerted"
-echo "  netwatch --selftest        # prove notifications work"
+echo "  systemctl --user status packetminder"
+echo "  journalctl --user -u packetminder -f"
+echo "  packetminder --status          # one interface sample"
+echo "  packetminder --replay -24h     # what would have alerted"
+echo "  packetminder --selftest        # prove notifications work"

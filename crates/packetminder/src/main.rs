@@ -1,7 +1,7 @@
 // =============================================================================
-// netwatch — background detector for inbound traffic nothing consumes.
+// packetminder — background detector for inbound traffic nothing consumes.
 //
-// netwatch's TUI and GUI answer "what are my connections doing?" by polling
+// packetminder's TUI and GUI answer "what are my connections doing?" by polling
 // `ss`. That is connection-oriented by construction, so it is blind to traffic
 // that never forms a connection: UDP aimed at a port with no socket has no row
 // in `ss`, no conntrack entry, and no owning process — yet it still saturates a
@@ -55,7 +55,7 @@ fn main() {
         Some("--selftest") => selftest(cfg),
         Some("--help" | "-h") => usage(),
         Some(other) => {
-            eprintln!("netwatch: unknown argument `{other}`");
+            eprintln!("packetminder: unknown argument `{other}`");
             usage();
             std::process::exit(2);
         }
@@ -64,7 +64,7 @@ fn main() {
 
 fn usage() {
     println!(
-        "Usage: netwatch [option]
+        "Usage: packetminder [option]
 
 Run with no arguments to start monitoring (this is what the service does).
 
@@ -361,7 +361,7 @@ fn status(cfg: Config) {
         },
         _ => println!(
             "firewall drops: unavailable — collector not installed \
-             (crates/netwatch/collector/install-collector.sh)"
+             (crates/packetminder/collector/install-collector.sh)"
         ),
     }
 }
@@ -370,20 +370,20 @@ fn selftest(cfg: Config) {
     let a = Alert {
         kind: "selftest",
         key: "selftest".to_string(),
-        title: "netwatch selftest".to_string(),
+        title: "packetminder selftest".to_string(),
         body: "If you can read this, notifications work.".to_string(),
         detail: "Emitted by --selftest, not by a detector.".to_string(),
         urgency: "normal",
     };
     alert::emit(&cfg, &a);
-    println!("Emitted a test alert. See: journalctl --user -u netwatch");
+    println!("Emitted a test alert. See: journalctl --user -u packetminder");
 
     // The button's click handler runs in a thread this process owns. Exiting
     // now would leave a popup whose button does nothing — worse than offering
     // no button at all. The daemon has no such problem because it never exits,
     // so this wait exists purely to make --selftest exercise the real path.
     if cfg.notify {
-        println!("Waiting 45s so the \"Open netwatch\" button works — Ctrl-C to skip.");
+        println!("Waiting 45s so the \"Open packetminder\" button works — Ctrl-C to skip.");
         thread::sleep(Duration::from_secs(45));
     }
 }

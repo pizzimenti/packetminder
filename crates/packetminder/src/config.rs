@@ -1,8 +1,8 @@
 // =============================================================================
 // config — tunables, loaded from a plain `key = value` file.
 //
-// Config lives at $XDG_CONFIG_HOME/netwatch/netwatch.conf (default
-// ~/.config/netwatch/netwatch.conf). Every key is optional; anything missing
+// Config lives at $XDG_CONFIG_HOME/packetminder/packetminder.conf (default
+// ~/.config/packetminder/packetminder.conf). Every key is optional; anything missing
 // falls back to the defaults below. Unknown keys are reported but ignored so a
 // stale config never stops the service from starting.
 // =============================================================================
@@ -94,7 +94,7 @@ pub struct Config {
     pub cooldown_secs: u64,
     /// Whether to raise desktop notifications.
     pub notify: bool,
-    /// Command an alert's "Open netwatch" button runs, split on whitespace —
+    /// Command an alert's "Open packetminder" button runs, split on whitespace —
     /// this is not a shell, so pipes and quoting will not work.
     ///
     /// Empty means detect a terminal emulator and run the TUI in it. Set it to
@@ -342,8 +342,8 @@ pub fn config_path() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
-        .join("netwatch")
-        .join("netwatch.conf")
+        .join("packetminder")
+        .join("packetminder.conf")
 }
 
 // -- Parsing Helpers ----------------------------------------------------------

@@ -1,12 +1,12 @@
 [Unit]
-Description=netwatch — detect inbound traffic nothing is consuming
-Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
+Description=packetminder — detect inbound traffic nothing is consuming
+Documentation=file:%h/Code/packetminder/crates/packetminder/README.md
 Wants=network.target
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/netwatch
+ExecStart=%h/.local/bin/packetminder
 Restart=on-failure
 RestartSec=10s
 

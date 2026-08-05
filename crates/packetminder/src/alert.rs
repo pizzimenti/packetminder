@@ -6,7 +6,7 @@
 // under the systemd user unit is the journal; notification is best-effort.
 //
 // The journal is the only log. It already timestamps, rotates and caps what it
-// stores, and `journalctl --user -u netwatch` queries it, so keeping a second
+// stores, and `journalctl --user -u packetminder` queries it, so keeping a second
 // hand-rolled copy on disk bought nothing but a file that could grow forever.
 // =============================================================================
 
@@ -76,12 +76,12 @@ pub fn log(message: &str) {
 fn notify(cfg: &Config, alert: &Alert) {
     // The synchronous hint makes a repeat alert replace its predecessor rather
     // than stacking another popup on the pile.
-    let hint = format!("string:x-canonical-private-synchronous:netwatch-{}", alert.key);
+    let hint = format!("string:x-canonical-private-synchronous:packetminder-{}", alert.key);
     let launch = tui_command(cfg);
 
     let mut args: Vec<String> = vec![
         "-a".into(),
-        "netwatch".into(),
+        "packetminder".into(),
         "-u".into(),
         alert.urgency.into(),
         "-i".into(),
@@ -91,7 +91,7 @@ fn notify(cfg: &Config, alert: &Alert) {
     ];
     if launch.is_some() {
         args.push("-A".into());
-        args.push("tui=Open netwatch".into());
+        args.push("tui=Open packetminder".into());
     }
     args.push(alert.title.clone());
     args.push(alert.body.clone());
@@ -113,7 +113,7 @@ fn notify(cfg: &Config, alert: &Alert) {
     let child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            eprintln!("netwatch: notify-send failed: {e}");
+            eprintln!("packetminder: notify-send failed: {e}");
             return;
         }
     };
@@ -138,7 +138,7 @@ fn notify(cfg: &Config, alert: &Alert) {
             .stderr(Stdio::null())
             .spawn()
         {
-            eprintln!("netwatch: cannot launch {program}: {e}");
+            eprintln!("packetminder: cannot launch {program}: {e}");
         }
     });
 }
@@ -160,7 +160,7 @@ fn tui_command(cfg: &Config) -> Option<Vec<String>> {
     }
 
     // Never offer a button that cannot work.
-    if !in_path("netwatch-tui") {
+    if !in_path("packetminder-tui") {
         return None;
     }
     for (terminal, flag) in [
@@ -173,7 +173,7 @@ fn tui_command(cfg: &Config) -> Option<Vec<String>> {
         ("gnome-terminal", "--"),
     ] {
         if in_path(terminal) {
-            return Some(vec![terminal.into(), flag.into(), "netwatch-tui".into()]);
+            return Some(vec![terminal.into(), flag.into(), "packetminder-tui".into()]);
         }
     }
     None
@@ -698,7 +698,7 @@ pub fn now_epoch() -> i64 {
 // -- Local Time ---------------------------------------------------------------
 //
 // glibc's `struct tm`, laid out by hand so we can call localtime_r without
-// pulling in the libc crate. netwatch-core does the same thing for its clock
+// pulling in the libc crate. packetminder-core does the same thing for its clock
 // column.
 
 #[repr(C)]

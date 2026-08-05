@@ -1,15 +1,15 @@
 [Unit]
-Description=netwatch collector — privileged counters for the unprivileged daemon
-Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
+Description=packetminder collector — privileged counters for the unprivileged daemon
+Documentation=file:%h/Code/packetminder/crates/packetminder/README.md
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/libexec/netwatch-collect
+ExecStart=/usr/local/libexec/packetminder-collect
 
-# Creates and keeps /run/netwatch. Preserve is required because this is a
+# Creates and keeps /run/packetminder. Preserve is required because this is a
 # oneshot: without it the directory would be removed the moment each run ends,
 # taking the snapshot with it.
-RuntimeDirectory=netwatch
+RuntimeDirectory=packetminder
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 

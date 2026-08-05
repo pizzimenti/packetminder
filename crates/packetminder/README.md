@@ -1,11 +1,11 @@
-# netwatch
+# packetminder
 
 A background service that notices inbound traffic **nothing on this host is
 consuming**, and raises a desktop notification naming the source.
 
 ## Why this exists, separately from the TUI
 
-`netwatch-core` polls `ss -tinH`. That is connection-oriented by construction,
+`packetminder-core` polls `ss -tinH`. That is connection-oriented by construction,
 so it can only ever show traffic that belongs to a socket. UDP aimed at a port
 with no listener has no socket, no conntrack entry, no owning process, and no
 row in `ss` — but it still fills the link.
@@ -189,10 +189,10 @@ and writes a commented default config on first run only. Safe to re-run.
 ## Use
 
 ```sh
-netwatch --status          # one interface sample, with rates
-netwatch --replay -24h     # what would have alerted over past history
-netwatch --selftest        # prove the notification path works
-journalctl --user -u netwatch -f
+packetminder --status          # one interface sample, with rates
+packetminder --replay -24h     # what would have alerted over past history
+packetminder --selftest        # prove the notification path works
+journalctl --user -u packetminder -f
 ```
 
 `--replay` is the honest way to tune thresholds. It re-runs the blocked-flow
@@ -236,7 +236,7 @@ limit changes that.
 
 ## Config
 
-`~/.config/netwatch/netwatch.conf`, plain `key = value`, all keys optional. Read
+`~/.config/packetminder/packetminder.conf`, plain `key = value`, all keys optional. Read
 at startup only; restart the service after editing.
 
 Defaults: 1 Mbps inbound floor, 2% asymmetry ratio held for 60s, 4 drop records
@@ -284,8 +284,8 @@ then the bare address.
 The journal, and only the journal:
 
 ```sh
-journalctl --user -u netwatch -f        # follow
-journalctl --user -u netwatch -S -7d    # last week
+journalctl --user -u packetminder -f        # follow
+journalctl --user -u packetminder -S -7d    # last week
 ```
 
 There is no second log file. systemd already timestamps, rotates and caps what
@@ -301,13 +301,13 @@ Retention is journald's, set in `/etc/systemd/journald.conf.d/limits.conf`
 Two things this daemon wants are root-only: conntrack byte counters and exact
 firewall drop totals. Rather than run the whole daemon as root, `collector/`
 installs a small system service that reads exactly those two and writes them to
-`/run/netwatch/snapshot`, world-readable.
+`/run/packetminder/snapshot`, world-readable.
 
 ```sh
-sudo crates/netwatch/collector/install-collector.sh
+sudo crates/packetminder/collector/install-collector.sh
 ```
 
-The split matters. netwatch parses input that hostile hosts influence — kernel
+The split matters. packetminder parses input that hostile hosts influence — kernel
 log lines carrying attacker-chosen addresses, mDNS names any LAN device can
 publish, whois answers from remote servers — and shells out with data derived
 from them. Running that as root would turn a parsing slip into a root
@@ -334,7 +334,7 @@ per-flow increments across expiries instead, yielding a monotonic figure.
 
 **`nf_conntrack_acct` only attaches counters to flows created after it is
 enabled.** Pre-existing flows stay uncounted permanently, which is why the
-installer writes `/etc/sysctl.d/99-netwatch-conntrack-acct.conf` rather than
+installer writes `/etc/sysctl.d/99-packetminder-conntrack-acct.conf` rather than
 setting it at runtime. Expect partial coverage until flows turn over.
 
 ## Privileges
@@ -346,7 +346,7 @@ It is dependency-free on purpose: it parses input that hostile hosts influence,
 so the smaller its supply chain the better. See *The collector* above for the
 same reasoning applied to privilege.
 
-It also does not link `netwatch-core`, though that is now a choice rather than a
+It also does not link `packetminder-core`, though that is now a choice rather than a
 constraint. Core used to be built with pyo3's `extension-module`, which left
 libpython symbols undefined — fine for a cdylib, a link error for a binary. The
 Python binding and the Qt app that used it are gone, so core is a plain rlib and

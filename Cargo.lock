@@ -245,19 +245,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "netwatch"
+name = "packetminder"
 version = "0.1.0"
 
 [[package]]
-name = "netwatch-core"
+name = "packetminder-core"
 version = "0.1.0"
 
 [[package]]
-name = "netwatch-tui"
+name = "packetminder-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "netwatch-core",
+ "packetminder-core",
  "ratatui",
 ]
 

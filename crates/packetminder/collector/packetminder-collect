@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# netwatch-collect — the privileged half of netwatch, kept deliberately small.
+# packetminder-collect — the privileged half of packetminder, kept deliberately small.
 #
-# netwatch itself runs unprivileged, because it parses input that hostile hosts
+# packetminder itself runs unprivileged, because it parses input that hostile hosts
 # influence: kernel log lines carrying attacker-chosen addresses and ports,
 # mDNS names any device on the LAN can publish, and whois answers from remote
 # servers. Running that as root would turn a parsing slip into a root
@@ -17,11 +17,11 @@
 #   counters    exact firewall drop packets and bytes, which the ufw log cannot
 #               give because its LOG rule is rate limited to 3/min.
 #
-# Output is key=value, one per line, at /run/netwatch/snapshot.
+# Output is key=value, one per line, at /run/packetminder/snapshot.
 
 set -euo pipefail
 
-out_dir=/run/netwatch
+out_dir=/run/packetminder
 out="$out_dir/snapshot"
 tmp="$out.tmp"
 

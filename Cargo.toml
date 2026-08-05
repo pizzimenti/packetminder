@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "crates/netwatch-core",
-    "crates/netwatch-tui",
-    "crates/netwatch",
+    "crates/packetminder-core",
+    "crates/packetminder-tui",
+    "crates/packetminder",
 ]
 resolver = "3"
