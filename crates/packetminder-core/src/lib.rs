@@ -217,9 +217,12 @@ pub fn run_whois(ip: &str) -> String {
 /// Convert an "ip:port" string into a u32 for numeric IP sorting.
 pub fn parse_ip_sort_key(remote: &str) -> u32 {
     let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote);
-    let parts: Vec<u32> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
+    // Octets parse as u8, not a wider type: "999.0.0.1" must sort as garbage
+    // (0), not shift a too-large value into the high byte — which overflowed,
+    // panicking in debug builds on any malformed address `ss` ever printed.
+    let parts: Vec<u8> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
     if parts.len() == 4 {
-        (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]
+        u32::from_be_bytes([parts[0], parts[1], parts[2], parts[3]])
     } else {
         0
     }
@@ -283,15 +286,26 @@ pub fn fmt_time(t: SystemTime) -> String {
         _zone: *const i8,
     }
     unsafe extern "C" {
-        fn localtime(t: *const i64) -> *const Tm;
+        // The _r variant writes into a caller-owned buffer. Plain localtime()
+        // returns a pointer into one process-wide static, which is fine right
+        // up until a second thread calls it — and this crate already spawns
+        // threads for whois lookups.
+        fn localtime_r(t: *const i64, result: *mut Tm) -> *mut Tm;
     }
-    unsafe {
-        let tm = localtime(&secs);
-        if tm.is_null() {
-            "??:??:??".into()
-        } else {
-            format!("{:02}:{:02}:{:02}", (*tm).tm_hour, (*tm).tm_min, (*tm).tm_sec)
-        }
+
+    let mut tm = Tm {
+        tm_sec: 0,
+        tm_min: 0,
+        tm_hour: 0,
+        _rest: [0; 6],
+        _gmtoff: 0,
+        _zone: std::ptr::null(),
+    };
+    let ok = unsafe { !localtime_r(&secs, &mut tm).is_null() };
+    if ok {
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    } else {
+        "??:??:??".into()
     }
 }
 
@@ -306,6 +320,38 @@ pub fn row_color(c: &Conn) -> &'static str {
         "yellow"
     } else {
         "white"
+    }
+}
+
+// -- Tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sort_keys_order_addresses_numerically() {
+        assert!(parse_ip_sort_key("10.3.59.7:443") < parse_ip_sort_key("10.3.60.1:80"));
+        assert!(parse_ip_sort_key("9.255.255.255") < parse_ip_sort_key("10.0.0.0"));
+        assert_eq!(parse_ip_sort_key("10.3.59.7:443"), parse_ip_sort_key("10.3.59.7"));
+    }
+
+    #[test]
+    fn malformed_addresses_sort_as_zero_rather_than_panicking() {
+        // An octet over 255 used to be shifted into the high byte, which
+        // overflowed and panicked in debug builds.
+        assert_eq!(parse_ip_sort_key("999.999.999.999"), 0);
+        assert_eq!(parse_ip_sort_key("[2605:59ca::1]:443"), 0);
+        assert_eq!(parse_ip_sort_key("not an address"), 0);
+        assert_eq!(parse_ip_sort_key(""), 0);
+    }
+
+    #[test]
+    fn extracts_numeric_fields_from_ss_info() {
+        let info = "bbr rto:230 bytes_sent:29955 bytes_received:29619 segs_out:717";
+        assert_eq!(extract_field(info, "bytes_received:"), 29619);
+        assert_eq!(extract_field(info, "bytes_sent:"), 29955);
+        assert_eq!(extract_field(info, "bytes_imaginary:"), 0);
     }
 }
 
