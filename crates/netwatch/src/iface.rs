@@ -21,7 +21,7 @@ use std::{
 use crate::{
     alert::{Alert, fmt_bits, fmt_duration},
     config::Config,
-    role,
+    role, sockets,
 };
 
 // -- Data Structures ----------------------------------------------------------
@@ -155,6 +155,33 @@ impl AsymDetector {
                 continue;
             }
 
+            // The last question before interrupting anyone: is something on
+            // this host actually reading the traffic? A fast download and a
+            // one-sided flood have the same ratio, so the ratio cannot tell
+            // them apart -- but a socket's receive counter can.
+            let accounted = if cfg.socket_corroboration {
+                sockets::established_rx_bps(Duration::from_secs(1))
+            } else {
+                None
+            };
+
+            if let Some(bps) = accounted
+                && bps >= rates.rx_bps * cfg.socket_account_ratio
+            {
+                crate::alert::log(&format!(
+                    "asymmetric-inbound withheld on {name} — established sockets account for \
+                     {} of {} inbound",
+                    fmt_bits(bps),
+                    fmt_bits(rates.rx_bps),
+                ));
+                // Re-earn the sustain window rather than taking the full
+                // cooldown. A flood starting behind a long download should not
+                // have to wait 30 minutes to be noticed, but re-measuring every
+                // tick for the length of that download is not worth the spawns.
+                self.since.remove(name);
+                continue;
+            }
+
             self.alerted.insert(name.clone(), now);
             alerts.push(build_alert(
                 name,
@@ -163,6 +190,7 @@ impl AsymDetector {
                 held.as_secs(),
                 hint.as_deref(),
                 routing,
+                accounted,
             ));
         }
 
@@ -180,6 +208,7 @@ fn build_alert(
     held_secs: u64,
     hint: Option<&str>,
     routing: bool,
+    accounted: Option<f64>,
 ) -> Alert {
     let ratio = if rx_bps > 0.0 {
         tx_bps / rx_bps * 100.0
@@ -217,6 +246,18 @@ fn build_alert(
              interface than it received on is behaving correctly.",
             role::forwarding_ifaces().join(", ")
         ));
+    }
+    match accounted {
+        Some(bps) => detail.push_str(&format!(
+            " Established TCP sockets account for only {} of it, so most of this is \
+             arriving unread. (TCP only — ss reports no byte counters for UDP, so a \
+             QUIC transfer would not show up here.)",
+            fmt_bits(bps)
+        )),
+        None => detail.push_str(
+            " Socket corroboration did not run, so whether anything is reading this \
+             is unverified.",
+        ),
     }
 
     Alert {

@@ -24,6 +24,13 @@ pub struct Config {
     pub asym_sustain_secs: u64,
     /// Interfaces to skip entirely.
     pub ignore_interfaces: Vec<String>,
+    /// Before alerting on asymmetry, ask whether an established socket is
+    /// actually reading the traffic. A fast download and a one-sided flood have
+    /// the same ratio, so no threshold can separate them — only this can.
+    pub socket_corroboration: bool,
+    /// Fraction of an interface's inbound that sockets must account for before
+    /// the traffic counts as wanted and the alert is dropped.
+    pub socket_account_ratio: f64,
 
     // -- Blocked-flow detector --
     /// Kernel-log pattern identifying a dropped packet.
@@ -113,6 +120,13 @@ impl Default for Config {
             // counting it too would double-report every event.
             ignore_interfaces: vec!["lo".into(), "tailscale0".into()],
 
+            socket_corroboration: true,
+            // Deliberately not 1.0. Sockets opening or closing mid-measurement
+            // are skipped, and non-TCP traffic is never counted at all, so the
+            // socket figure always reads a little low. 70% is "most of this is
+            // explained" without demanding an accounting that cannot be exact.
+            socket_account_ratio: 0.7,
+
             block_pattern: "UFW BLOCK".into(),
             block_min_events: 4,
             block_window_secs: 900,
@@ -173,6 +187,11 @@ impl Config {
                 "rx_floor_bps" => set_f64(&mut cfg.rx_floor_bps, value),
                 "asym_ratio" => set_f64(&mut cfg.asym_ratio, value),
                 "asym_sustain_secs" => set_u64(&mut cfg.asym_sustain_secs, value),
+                "socket_corroboration" => {
+                    cfg.socket_corroboration = matches!(value, "1" | "true" | "yes" | "on");
+                    true
+                }
+                "socket_account_ratio" => set_f64(&mut cfg.socket_account_ratio, value),
                 "ignore_interfaces" => {
                     cfg.ignore_interfaces = value
                         .split(',')
@@ -281,6 +300,7 @@ impl Config {
 
         format!(
             "interval={}s rx_floor={:.1}Mbps asym_ratio={:.0}% sustain={}s \
+             socket_corroboration={} ({:.0}% accounted) \
              block_min_events={} block_min_span={}s ignore_ports={ignored} \
              self_window={}s self_min_active_minutes={} {proto} named_devices={} \
              cooldown={}s notify={}",
@@ -288,6 +308,8 @@ impl Config {
             self.rx_floor_bps / 1_000_000.0,
             self.asym_ratio * 100.0,
             self.asym_sustain_secs,
+            self.socket_corroboration,
+            self.socket_account_ratio * 100.0,
             self.block_min_events,
             self.block_min_span_secs,
             self.self_window_secs,

@@ -25,6 +25,7 @@ mod local;
 mod proto;
 mod role;
 mod selfblock;
+mod sockets;
 
 use std::{
     collections::HashSet, env, net::IpAddr, process::Command, thread,
@@ -325,6 +326,22 @@ fn status(cfg: Config) {
             alert::fmt_bits(r.rx_bps),
             alert::fmt_bits(r.tx_bps),
         );
+    }
+
+    // The question a one-sided reading actually raises: is anything reading it?
+    if cfg.socket_corroboration {
+        let total_rx: f64 = detector.rates.values().map(|r| r.rx_bps).sum();
+        match sockets::established_rx_bps(Duration::from_secs(1)) {
+            Some(bps) => {
+                let share = if total_rx > 0.0 { bps / total_rx * 100.0 } else { 0.0 };
+                println!(
+                    "\nestablished TCP sockets receiving {} of {} inbound ({share:.0}% accounted)",
+                    alert::fmt_bits(bps),
+                    alert::fmt_bits(total_rx),
+                );
+            }
+            None => println!("\nestablished TCP sockets: could not measure (ss unavailable)"),
+        }
     }
 }
 
