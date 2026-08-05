@@ -28,8 +28,8 @@ use std::{
 
 use crate::{
     alert::{
-        self, Alert, describe_source, device_label, fmt_bytes, fmt_duration, is_private, now_epoch,
-        port_in_use,
+        self, Alert, describe_source, device_label, fmt_bytes, fmt_duration, identity, is_private,
+        now_epoch, port_in_use,
     },
     config::Config,
     local::{LocalNet, parse_ip},
@@ -400,20 +400,27 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     let nearby =
         parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(&key.src);
 
-    // Two lines, both of which answer a question you would actually ask: how
-    // long has this been happening, and does anything here want the traffic.
-    let mut body = format!(
-        "{} drops over {} on {}, still going.\n",
-        state.total, duration, state.iface,
-    );
-    if listening {
-        body.push_str(&format!(
-            "Something IS listening on {proto}/{} — the firewall is blocking it.",
-            key.dport
-        ));
-    } else {
-        body.push_str(&format!("Nothing is listening on {proto}/{}.", key.dport));
+    // Line one is what we worked out the device is; line two is what it did.
+    // The raw hostname and address live in the title, because that is the half
+    // you act on.
+    let (who, derived) = identity(&key.src);
+
+    let mut body = String::new();
+    if let Some(d) = &derived {
+        body.push_str(d);
+        body.push('\n');
     }
+    body.push_str(&format!(
+        "{} drops over {} on {}, still going. {}",
+        state.total,
+        duration,
+        state.iface,
+        if listening {
+            "Something IS listening — the firewall is blocking it."
+        } else {
+            "Nothing is listening."
+        },
+    ));
 
     // Everything below is true and occasionally useful, and none of it is worth
     // making the popup unreadable for.
@@ -442,11 +449,7 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
         // Keyed on the address and never the resolved name, so that the popup
         // still replaces its predecessor when a name starts or stops resolving.
         key: format!("flow-{}-{}-{}", key.src, proto, key.dport),
-        title: format!(
-            "{} keeps hitting blocked {proto}/{}",
-            device_label(&key.src),
-            key.dport
-        ),
+        title: format!("{who} — blocked {proto}/{}", key.dport),
         body,
         detail,
         urgency,

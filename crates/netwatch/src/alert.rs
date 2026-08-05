@@ -189,6 +189,45 @@ pub fn device_label(ip: &str) -> String {
     }
 }
 
+/// Split a device into what the network calls it and what we worked out.
+///
+/// Returns `("X01000EKSRNP.local (10.3.193.195)", Some("Roku CRR · Roku"))`.
+///
+/// The first is the raw network identity, and it goes first because it is the
+/// actionable half: it is what you paste into a firewall rule, a capture
+/// filter, or a grep. The second is everything derived — the name you chose,
+/// the vendor behind the MAC — which is what tells you what the thing actually
+/// is. Collapsing them into one label, as this used to, always threw away
+/// whichever half the reader happened to need.
+pub fn identity(ip: &str) -> (String, Option<String>) {
+    let hostname = hostname_for(ip)
+        .and_then(|n| n.split('.').next().map(str::to_string))
+        .filter(|n| !n.is_empty());
+
+    let primary = match hostname_for(ip) {
+        Some(fqdn) => format!("{fqdn} ({ip})"),
+        None => ip.to_string(),
+    };
+
+    let mut derived: Vec<String> = Vec::new();
+    if let Some(chosen) = chosen_name(ip) {
+        derived.push(chosen);
+    }
+    if let Some(vendor) = vendor_for(ip) {
+        // Saying "Roku" under a hostname of "roku-living-room" is noise.
+        let already_said = derived
+            .iter()
+            .chain(hostname.iter())
+            .any(|s| s.to_lowercase().contains(&vendor.to_lowercase()));
+        if !already_said {
+            derived.push(vendor);
+        }
+    }
+
+    let derived = (!derived.is_empty()).then(|| derived.join(" · "));
+    (primary, derived)
+}
+
 /// True for names no human picked: `X01000EKSRNP`, `AC233FA1B2C3`. Shouting
 /// alphanumerics of identifier length, with no lowercase anywhere.
 fn looks_machine_generated(label: &str) -> bool {
