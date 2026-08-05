@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# netwatch-collect — the privileged half of netwatch, kept deliberately small.
+#
+# netwatch itself runs unprivileged, because it parses input that hostile hosts
+# influence: kernel log lines carrying attacker-chosen addresses and ports,
+# mDNS names any device on the LAN can publish, and whois answers from remote
+# servers. Running that as root would turn a parsing slip into a root
+# compromise, sourced from the very hosts it is watching.
+#
+# Two things it needs are nevertheless root-only. This script reads exactly
+# those two, aggregates them to a handful of integers, and writes them where the
+# unprivileged daemon can read them. It parses nothing that comes from the
+# network, makes no connections, and never notifies anybody.
+#
+#   conntrack   reply-direction byte totals. Unlike `ss` this covers UDP, which
+#               is what makes QUIC transfers corroborable at all.
+#   counters    exact firewall drop packets and bytes, which the ufw log cannot
+#               give because its LOG rule is rate limited to 3/min.
+#
+# Output is key=value, one per line, at /run/netwatch/snapshot.
+
+set -euo pipefail
+
+out_dir=/run/netwatch
+out="$out_dir/snapshot"
+tmp="$out.tmp"
+
+install -d -m 0755 "$out_dir"
+
+# -- conntrack ----------------------------------------------------------------
+# Each entry carries two "bytes=" fields: the original direction first, then the
+# reply. For a flow this host initiated, the reply total is what it received.
+#
+# Flows initiated *from* outside invert that, so this over-counts on a host
+# serving inbound connections. On a default-deny desktop those are rare, and the
+# figure is used as corroboration -- "is anything consuming this?" -- not as an
+# exact accounting.
+#
+# Requires net.netfilter.nf_conntrack_acct=1, or every bytes= field reads zero.
+#
+# Summing the live table is NOT a counter -- it is a gauge. Every entry holds
+# bytes-so-far for a flow that will eventually expire and be removed, so the sum
+# falls whenever a large flow ages out. Measured: a 94 MB upload immediately
+# after a 98 MB download produced a delta of *minus* 97 MB, because the download
+# entry vanished between samples.
+#
+# So accumulate instead: remember each flow's last seen reply total, add only
+# the positive per-flow increments, and carry the running sum across expiries.
+# That yields a monotonic counter the reader can subtract two samples of.
+state="$out_dir/ct.state"
+accum="$out_dir/ct.accum"
+ct_bytes=0
+ct_flows=0
+
+if [[ -r /proc/net/nf_conntrack ]]; then
+    prev_total=$(cat "$accum" 2>/dev/null || echo 0)
+    [[ "$prev_total" =~ ^[0-9]+$ ]] || prev_total=0
+
+    read -r ct_flows ct_bytes < <(
+        awk -v prev_file="$state" -v prev_total="$prev_total" '
+        BEGIN {
+            # Last cycle: "flowkey replybytes" per line.
+            while ((getline line < prev_file) > 0) {
+                split(line, f, " ")
+                if (f[1] != "") seen[f[1]] = f[2]
+            }
+            close(prev_file)
+        }
+        {
+            # First src/dst/sport/dport are the original direction and identify
+            # the flow; the second bytes= is the reply direction, which for a
+            # locally initiated flow is what this host received.
+            key = ""; reply = ""; nb = 0
+            split("", got)
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^(src|dst|sport|dport)=/) {
+                    split($i, kv, "=")
+                    if (!(kv[1] in got)) { got[kv[1]] = kv[2]; key = key kv[1] ":" kv[2] "|" }
+                } else if ($i ~ /^bytes=/) {
+                    nb++
+                    if (nb == 2) { split($i, kv, "="); reply = kv[2] }
+                }
+            }
+            if (key == "" || reply == "") next
+
+            flows++
+            # A key can recur if a flow is torn down and re-established with the
+            # same tuple; treating a drop as a restart rather than as negative
+            # keeps the accumulator monotonic.
+            delta = (key in seen && reply >= seen[key]) ? reply - seen[key] : reply
+            total += delta
+            print key, reply > (prev_file ".new")
+        }
+        END {
+            close(prev_file ".new")
+            printf "%d %d\n", flows + 0, prev_total + total
+        }' /proc/net/nf_conntrack
+    )
+
+    mv -f "$state.new" "$state" 2>/dev/null || true
+    printf '%s\n' "$ct_bytes" >"$accum"
+    chmod 0600 "$state" "$accum" 2>/dev/null || true
+fi
+
+# -- firewall counters --------------------------------------------------------
+# The INPUT policy line carries the packets and bytes that fell through every
+# rule to the default DROP. That is the exact volume the rate-limited log can
+# only sample.
+drop_packets=0
+drop_bytes=0
+if command -v iptables >/dev/null 2>&1; then
+    read -r drop_packets drop_bytes < <(
+        iptables -L INPUT -v -n -x 2>/dev/null |
+            awk '/^Chain INPUT/ {
+                # "Chain INPUT (policy DROP 1835 packets, 643506 bytes)" -- the
+                # paren is glued to "policy", so match it rather than compare.
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^\(?policy$/) { pkts = $(i + 2); bytes = $(i + 4) }
+                }
+                printf "%d %d\n", pkts + 0, bytes + 0
+                exit
+            }'
+    )
+fi
+
+# Written to a temporary file and renamed, so a reader never sees a half-written
+# snapshot. rename(2) within one filesystem is atomic.
+{
+    printf 'at=%s\n' "$(date +%s)"
+    printf 'conntrack_flows=%s\n' "${ct_flows:-0}"
+    printf 'conntrack_reply_bytes=%s\n' "${ct_bytes:-0}"
+    printf 'input_drop_packets=%s\n' "${drop_packets:-0}"
+    printf 'input_drop_bytes=%s\n' "${drop_bytes:-0}"
+} >"$tmp"
+
+chmod 0644 "$tmp"
+mv -f "$tmp" "$out"

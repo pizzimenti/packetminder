@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh netwatch's privileged counter snapshot
+Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=5s
+# The daemon takes deltas between two reads, so a late refresh widens its
+# measurement window rather than corrupting it. Accuracy here is not worth
+# waking a sleeping CPU for.
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

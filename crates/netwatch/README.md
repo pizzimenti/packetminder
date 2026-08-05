@@ -296,6 +296,47 @@ disk at all now, which is why the unit needs no `StateDirectory=`.
 Retention is journald's, set in `/etc/systemd/journald.conf.d/limits.conf`
 (`SystemMaxUse=200M`, currently about three weeks of history on this machine).
 
+## The collector (optional, privileged)
+
+Two things this daemon wants are root-only: conntrack byte counters and exact
+firewall drop totals. Rather than run the whole daemon as root, `collector/`
+installs a small system service that reads exactly those two and writes them to
+`/run/netwatch/snapshot`, world-readable.
+
+```sh
+sudo crates/netwatch/collector/install-collector.sh
+```
+
+The split matters. netwatch parses input that hostile hosts influence — kernel
+log lines carrying attacker-chosen addresses, mDNS names any LAN device can
+publish, whois answers from remote servers — and shells out with data derived
+from them. Running that as root would turn a parsing slip into a root
+compromise, sourced from the very hosts it is watching. The collector instead
+parses nothing from the network, opens no connections, notifies nobody, and
+runs with a capability bounding set of exactly `CAP_NET_ADMIN` and
+`CAP_DAC_READ_SEARCH`.
+
+It closes the two gaps documented above:
+
+| gap | closed by |
+| --- | --- |
+| `ss` has no byte counters for UDP, so QUIC transfers cannot be corroborated | conntrack tracks UDP flows. Measured at 99% of a 61.8 MB UDP transfer. |
+| the ufw log is rate limited, so drop counts measure the limiter | `input_drop_packets` / `input_drop_bytes`, exact |
+
+Two implementation notes worth knowing, both found by testing rather than
+reasoning:
+
+**Summing the live conntrack table is a gauge, not a counter.** Each entry holds
+bytes-so-far for a flow that eventually expires and is removed, so the total
+*falls* when a large flow ages out — a 94 MB upload right after a 98 MB download
+produced a delta of minus 97 MB. The collector therefore accumulates positive
+per-flow increments across expiries instead, yielding a monotonic figure.
+
+**`nf_conntrack_acct` only attaches counters to flows created after it is
+enabled.** Pre-existing flows stay uncounted permanently, which is why the
+installer writes `/etc/sysctl.d/99-netwatch-conntrack-acct.conf` rather than
+setting it at runtime. Expect partial coverage until flows turn over.
+
 ## Privileges
 
 None. It reads `/proc/net/*` and the journal, both available to a normal user

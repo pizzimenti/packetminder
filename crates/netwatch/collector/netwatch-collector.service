@@ -1,0 +1,36 @@
+[Unit]
+Description=netwatch collector — privileged counters for the unprivileged daemon
+Documentation=file:%h/Code/netwatch/crates/netwatch/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/netwatch-collect
+
+# Creates and keeps /run/netwatch. Preserve is required because this is a
+# oneshot: without it the directory would be removed the moment each run ends,
+# taking the snapshot with it.
+RuntimeDirectory=netwatch
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+
+# This runs as root, so the interesting question is what it is prevented from
+# doing. It reads two kernel tables and writes one small file; everything else
+# is closed off. CAP_NET_ADMIN is what iptables needs, CAP_DAC_READ_SEARCH is
+# what reading root-owned /proc/net/nf_conntrack needs, and nothing else is on
+# the bounding set at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LockPersonality=yes
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target
