@@ -109,6 +109,11 @@ fi
 drop_packets=0
 drop_bytes=0
 if command -v iptables >/dev/null 2>&1; then
+    # `|| true`, because under set -e a `read` that gets no input is fatal —
+    # and awk prints nothing when there is no "Chain INPUT" line to match,
+    # which is exactly what an nftables-only backend produces. Dying here would
+    # leave the snapshot unwritten forever, silently. On the fallback path the
+    # variables come back empty and the :-0 defaults below cover them.
     read -r drop_packets drop_bytes < <(
         iptables -L INPUT -v -n -x 2>/dev/null |
             awk '/^Chain INPUT/ {
@@ -120,7 +125,7 @@ if command -v iptables >/dev/null 2>&1; then
                 printf "%d %d\n", pkts + 0, bytes + 0
                 exit
             }'
-    )
+    ) || true
 fi
 
 # Written to a temporary file and renamed, so a reader never sees a half-written

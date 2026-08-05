@@ -1,6 +1,7 @@
 [Unit]
 Description=Refresh packetminder's privileged counter snapshot
-Documentation=file:%h/Code/packetminder/crates/packetminder/README.md
+# Not file:%h/…: in a *system* unit %h resolves to /root, per systemd.unit(5).
+Documentation=https://github.com/pizzimenti/packetminder
 
 [Timer]
 OnBootSec=15s
