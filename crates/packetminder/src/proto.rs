@@ -293,18 +293,24 @@ mod tests {
 
         // 100 datagrams every 10s tick is 10/s, well over the 5/s threshold.
         // Run 200 ticks: 1990 seconds of sustained condition.
-        let mut fired = 0;
+        let mut fired_at: Vec<i64> = Vec::new();
         for i in 0..200 {
             let at = base + i * 10;
-            let alerts = d.evaluate(&cfg, at, sample(at, (i as u64) * 100));
-            fired += alerts.len();
+            if !d.evaluate(&cfg, at, sample(at, (i as u64) * 100)).is_empty() {
+                fired_at.push(at);
+            }
         }
 
         // First alert once sustain is reached at t=+60. The second cannot come
-        // before +1860 (cooldown measured from the first), and does, because
-        // the sustain stays banked while the cooldown holds. 1990s of condition
-        // is exactly 2 alerts — not the ~32 the pre-cooldown behaviour gave.
-        assert_eq!(fired, 2, "cooldown must gate re-alerts, not just sustain");
+        // before +1860 — the full configured cooldown after the first — and
+        // lands exactly there, because the sustain stays banked while the
+        // cooldown holds. Asserting the timestamps, not just the count: a
+        // regression to a shorter cooldown would still produce two alerts.
+        assert_eq!(
+            fired_at,
+            vec![base + 60, base + 1860],
+            "second alert must wait out the full cooldown, then land immediately"
+        );
     }
 
     #[test]

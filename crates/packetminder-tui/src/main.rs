@@ -131,18 +131,40 @@ fn draw(f: &mut Frame, app: &App, table_state: &mut TableState) {
 
 // -- Entry Point --------------------------------------------------------------
 
+/// Undo raw mode and the alternate screen. Safe to call more than once and
+/// from any exit path — both restores are no-ops when already restored.
+fn restore_terminal() {
+    let _ = terminal::disable_raw_mode();
+    let _ = stdout().execute(LeaveAlternateScreen);
+}
+
+/// Restores the terminal when dropped, which covers every `?` early return in
+/// main — a panic hook only covers unwinding, not errors.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
 fn main() -> io::Result<()> {
     stdout().execute(EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
+    let _guard = TerminalGuard;
 
-    // A panic between here and the teardown at the bottom would otherwise
-    // leave the user's terminal in raw mode on the alternate screen — no echo,
-    // no line editing, and the panic message swallowed with it. Restore first,
-    // then let the default hook print the message somewhere it can be read.
+    // A panic before the guard unwinds would print its message into the
+    // alternate screen, where it vanishes with the screen. Restore first, then
+    // let the default hook print somewhere readable.
+    //
+    // The hook is process-wide, and core spawns whois worker threads: a worker
+    // panic must not tear the terminal down under a still-running event loop,
+    // so only the main thread restores here.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = terminal::disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
+        if std::thread::current().name() == Some("main") {
+            restore_terminal();
+        }
         default_hook(info);
     }));
 
@@ -181,7 +203,6 @@ fn main() -> io::Result<()> {
         }
     }
 
-    terminal::disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
+    // The guard restores the terminal on this return and on every early one.
     Ok(())
 }
