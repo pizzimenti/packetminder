@@ -135,16 +135,30 @@ fn main() -> io::Result<()> {
     stdout().execute(EnterAlternateScreen)?;
     terminal::enable_raw_mode()?;
 
+    // A panic between here and the teardown at the bottom would otherwise
+    // leave the user's terminal in raw mode on the alternate screen — no echo,
+    // no line editing, and the panic message swallowed with it. Restore first,
+    // then let the default hook print the message somewhere it can be read.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = terminal::disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        default_hook(info);
+    }));
+
     let backend = ratatui::backend::CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new();
     let mut table_state = TableState::default();
-    let mut last_poll = Instant::now() - Duration::from_secs(10);
+    // None rather than a back-dated Instant: subtracting from Instant::now()
+    // panics if the monotonic clock is younger than the offset, i.e. within
+    // the first seconds after boot.
+    let mut last_poll: Option<Instant> = None;
 
     loop {
-        if last_poll.elapsed() >= POLL_INTERVAL {
+        if last_poll.is_none_or(|at| at.elapsed() >= POLL_INTERVAL) {
             app.poll();
-            last_poll = Instant::now();
+            last_poll = Some(Instant::now());
         }
 
         terminal.draw(|f| draw(f, &app, &mut table_state))?;
