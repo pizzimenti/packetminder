@@ -285,6 +285,11 @@ impl Config {
         if cfg.interval_secs == 0 {
             cfg.interval_secs = 1;
         }
+        // Detectors compare cooldowns against i64 epoch arithmetic. A value
+        // past i64::MAX would wrap negative there and read as always-cooled;
+        // clamping once here keeps every cast downstream honest. Nobody sets a
+        // 292-billion-year cooldown on purpose, but a config typo can.
+        cfg.cooldown_secs = cfg.cooldown_secs.min(i64::MAX as u64);
         cfg
     }
 

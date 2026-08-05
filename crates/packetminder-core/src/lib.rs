@@ -226,12 +226,21 @@ pub fn parse_ip_sort_key(remote: &str) -> u32 {
     // Octets parse as u8, not a wider type: "999.0.0.1" must sort as garbage
     // (0), not shift a too-large value into the high byte — which overflowed,
     // panicking in debug builds on any malformed address `ss` ever printed.
-    let parts: Vec<u8> = ip.split('.').filter_map(|s| s.parse().ok()).collect();
-    if parts.len() == 4 {
-        u32::from_be_bytes([parts[0], parts[1], parts[2], parts[3]])
-    } else {
-        0
+    //
+    // Every component must parse, and there must be exactly four. The earlier
+    // filter_map dropped failures, so "1.2.bad.3.4" collapsed to four valid
+    // octets and sorted as a real address.
+    let mut octets = [0u8; 4];
+    let mut count = 0;
+    for part in ip.split('.') {
+        let Ok(octet) = part.parse() else { return 0 };
+        if count == 4 {
+            return 0; // five or more components
+        }
+        octets[count] = octet;
+        count += 1;
     }
+    if count == 4 { u32::from_be_bytes(octets) } else { 0 }
 }
 
 /// Extract a numeric value from a "key:value" pair in the ss info string.
@@ -350,6 +359,11 @@ mod tests {
         assert_eq!(parse_ip_sort_key("[2605:59ca::1]:443"), 0);
         assert_eq!(parse_ip_sort_key("not an address"), 0);
         assert_eq!(parse_ip_sort_key(""), 0);
+        // A bad component must poison the whole address, not be skipped so the
+        // remaining four sort as if they were the real thing.
+        assert_eq!(parse_ip_sort_key("1.2.bad.3.4"), 0);
+        assert_eq!(parse_ip_sort_key("1.2.bad.4"), 0);
+        assert_eq!(parse_ip_sort_key("1.2.3.4.5"), 0);
     }
 
     #[test]

@@ -19,6 +19,11 @@ hours while every conventional tool showed an idle network.
 | [`crates/packetminder-tui`](crates/packetminder-tui/) | Interactive terminal viewer for live TCP connections — the "what are my connections doing?" side, for when the daemon's alert points you at something worth watching. |
 | [`crates/packetminder-core`](crates/packetminder-core/) | Shared connection-polling library behind the TUI. |
 
+## Platform
+
+Linux only, by the nature of what it reads: `/proc/net/*`, the systemd
+journal, netfilter drop records, and glibc's `localtime_r`. Rust 1.88+.
+
 ## Quick start
 
 ```sh
