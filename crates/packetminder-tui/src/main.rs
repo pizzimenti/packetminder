@@ -163,20 +163,20 @@ fn main() -> io::Result<()> {
 
         terminal.draw(|f| draw(f, &app, &mut table_state))?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                    KeyCode::Tab => app.sort_col = (app.sort_col + 1) % COL_COUNT,
-                    KeyCode::Char('j') | KeyCode::Down => table_state.scroll_down_by(1),
-                    KeyCode::Char('k') | KeyCode::Up => table_state.scroll_up_by(1),
-                    KeyCode::PageDown => table_state.scroll_down_by(10),
-                    KeyCode::PageUp => table_state.scroll_up_by(10),
-                    _ => {}
-                }
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                KeyCode::Tab => app.sort_col = (app.sort_col + 1) % COL_COUNT,
+                KeyCode::Char('j') | KeyCode::Down => table_state.scroll_down_by(1),
+                KeyCode::Char('k') | KeyCode::Up => table_state.scroll_up_by(1),
+                KeyCode::PageDown => table_state.scroll_down_by(10),
+                KeyCode::PageUp => table_state.scroll_up_by(10),
+                _ => {}
             }
         }
     }

@@ -188,8 +188,8 @@ mod tests {
         // Shifting a u32 by 32 is undefined behaviour in the naive version.
         assert_eq!(network_of("10.0.0.1/0").as_deref(), Some("0.0.0.0/0"));
         assert_eq!(network_of("10.0.0.1/32").as_deref(), Some("10.0.0.1/32"));
-        assert_eq!(network_of("garbage").is_none(), true);
-        assert_eq!(network_of("10.0.0.1/33").is_none(), true);
+        assert!(network_of("garbage").is_none());
+        assert!(network_of("10.0.0.1/33").is_none());
     }
 
     #[test]
