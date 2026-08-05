@@ -340,7 +340,16 @@ setting it at runtime. Expect partial coverage until flows turn over.
 ## Privileges
 
 None. It reads `/proc/net/*` and the journal, both available to a normal user
-in a journal-reading group. It is dependency-free and does not link
-`netwatch-core` — that crate is built with pyo3's `extension-module`, which
-leaves libpython symbols undefined, which is fine for a cdylib and a link error
-for a binary.
+in a journal-reading group.
+
+It is dependency-free on purpose: it parses input that hostile hosts influence,
+so the smaller its supply chain the better. See *The collector* above for the
+same reasoning applied to privilege.
+
+It also does not link `netwatch-core`, though that is now a choice rather than a
+constraint. Core used to be built with pyo3's `extension-module`, which left
+libpython symbols undefined — fine for a cdylib, a link error for a binary. The
+Python binding and the Qt app that used it are gone, so core is a plain rlib and
+this *could* link it. It still should not: core polls `ss` to describe
+connections, which is precisely the question this daemon exists because nothing
+could answer.

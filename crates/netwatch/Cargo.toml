@@ -7,8 +7,13 @@ edition = "2024"
 name = "netwatch"
 path = "src/main.rs"
 
-# Intentionally dependency-free. This runs as a long-lived user service, so the
-# smaller its supply chain the better. It also cannot link netwatch-core, which
-# is built with pyo3's `extension-module` feature and therefore leaves the
+# Intentionally dependency-free. This runs as a long-lived user service parsing
+# input that hostile hosts influence, so the smaller its supply chain the better.
+#
+# It does not link netwatch-core either, though that is now a choice rather than
+# a constraint: core used to be built with pyo3's `extension-module`, which left
 # libpython symbols undefined — fine for a cdylib, a link error for a binary.
+# The Python binding is gone and core is a plain rlib, so this could link it. It
+# still should not: core polls `ss` to describe connections, which is the exact
+# question this daemon exists because nobody could answer.
 [dependencies]

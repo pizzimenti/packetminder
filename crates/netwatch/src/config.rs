@@ -94,6 +94,12 @@ pub struct Config {
     pub cooldown_secs: u64,
     /// Whether to raise desktop notifications.
     pub notify: bool,
+    /// Command an alert's "Open netwatch" button runs, split on whitespace —
+    /// this is not a shell, so pipes and quoting will not work.
+    ///
+    /// Empty means detect a terminal emulator and run the TUI in it. Set it to
+    /// `off` to drop the button entirely.
+    pub tui_command: String,
 }
 
 impl Default for Config {
@@ -157,6 +163,7 @@ impl Default for Config {
 
             cooldown_secs: 1800,
             notify: true,
+            tui_command: String::new(),
         }
     }
 }
@@ -253,6 +260,10 @@ impl Config {
                 "cooldown_secs" => set_u64(&mut cfg.cooldown_secs, value),
                 "notify" => {
                     cfg.notify = matches!(value, "1" | "true" | "yes" | "on");
+                    true
+                }
+                "tui_command" => {
+                    cfg.tui_command = value.to_string();
                     true
                 }
                 _ => {

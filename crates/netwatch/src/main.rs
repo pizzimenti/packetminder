@@ -377,4 +377,13 @@ fn selftest(cfg: Config) {
     };
     alert::emit(&cfg, &a);
     println!("Emitted a test alert. See: journalctl --user -u netwatch");
+
+    // The button's click handler runs in a thread this process owns. Exiting
+    // now would leave a popup whose button does nothing — worse than offering
+    // no button at all. The daemon has no such problem because it never exits,
+    // so this wait exists purely to make --selftest exercise the real path.
+    if cfg.notify {
+        println!("Waiting 45s so the \"Open netwatch\" button works — Ctrl-C to skip.");
+        thread::sleep(Duration::from_secs(45));
+    }
 }

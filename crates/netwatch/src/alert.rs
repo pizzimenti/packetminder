@@ -12,6 +12,7 @@
 
 use std::{
     collections::HashMap,
+    env,
     fmt::Write as _,
     fs,
     net::Ipv4Addr,
@@ -59,7 +60,7 @@ pub fn emit(cfg: &Config, alert: &Alert) {
     log(&line);
 
     if cfg.notify {
-        notify(alert);
+        notify(cfg, alert);
     }
 }
 
@@ -72,30 +73,117 @@ pub fn log(message: &str) {
     eprint!("{} {}\n", fmt_iso_local(now_epoch()), message);
 }
 
-fn notify(alert: &Alert) {
+fn notify(cfg: &Config, alert: &Alert) {
     // The synchronous hint makes a repeat alert replace its predecessor rather
     // than stacking another popup on the pile.
     let hint = format!("string:x-canonical-private-synchronous:netwatch-{}", alert.key);
-    let result = Command::new("notify-send")
-        .args([
-            "-a",
-            "netwatch",
-            "-u",
-            alert.urgency,
-            "-i",
-            "network-wired",
-            "-h",
-            &hint,
-            &alert.title,
-            &alert.body,
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let launch = tui_command(cfg);
 
-    if let Err(e) = result {
-        eprintln!("netwatch: notify-send failed: {e}");
+    let mut args: Vec<String> = vec![
+        "-a".into(),
+        "netwatch".into(),
+        "-u".into(),
+        alert.urgency.into(),
+        "-i".into(),
+        "network-wired".into(),
+        "-h".into(),
+        hint,
+    ];
+    if launch.is_some() {
+        args.push("-A".into());
+        args.push("tui=Open netwatch".into());
     }
+    args.push(alert.title.clone());
+    args.push(alert.body.clone());
+
+    // `-A` implies `--wait`: notify-send stays alive until the popup is
+    // dismissed or the button is pressed, then prints the action name on
+    // stdout. So it must be spawned and waited on off the detector loop, which
+    // cannot stall for however long a notification sits on somebody's screen.
+    let spawned = Command::new("notify-send")
+        .args(&args)
+        .stdout(if launch.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .spawn();
+
+    let child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("netwatch: notify-send failed: {e}");
+            return;
+        }
+    };
+
+    thread::spawn(move || {
+        let Ok(out) = child.wait_with_output() else {
+            return;
+        };
+        let Some(cmd) = launch else {
+            return; // No button was offered; the wait was only to reap it.
+        };
+        // Anything else means the popup was dismissed rather than actioned.
+        if String::from_utf8_lossy(&out.stdout).trim() != "tui" {
+            return;
+        }
+        let Some((program, rest)) = cmd.split_first() else {
+            return;
+        };
+        if let Err(e) = Command::new(program)
+            .args(rest)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            eprintln!("netwatch: cannot launch {program}: {e}");
+        }
+    });
+}
+
+/// What the alert's button should run, or None to offer no button.
+///
+/// Split on whitespace rather than run through a shell: an alert body contains
+/// attacker-influenced text, and while that text never reaches this command,
+/// keeping a shell out of the notification path entirely is cheaper than
+/// reasoning about whether it could.
+fn tui_command(cfg: &Config) -> Option<Vec<String>> {
+    let configured = cfg.tui_command.trim();
+    if configured.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    if !configured.is_empty() {
+        let parts: Vec<String> = configured.split_whitespace().map(String::from).collect();
+        return (!parts.is_empty()).then_some(parts);
+    }
+
+    // Never offer a button that cannot work.
+    if !in_path("netwatch-tui") {
+        return None;
+    }
+    for (terminal, flag) in [
+        ("konsole", "-e"),
+        ("alacritty", "-e"),
+        ("kitty", "-e"),
+        ("foot", "-e"),
+        ("xterm", "-e"),
+        // gnome-terminal wants `--` where the rest want `-e`.
+        ("gnome-terminal", "--"),
+    ] {
+        if in_path(terminal) {
+            return Some(vec![terminal.into(), flag.into(), "netwatch-tui".into()]);
+        }
+    }
+    None
+}
+
+fn in_path(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|dir| dir.join(name).is_file())
 }
 
 // -- Source Enrichment --------------------------------------------------------

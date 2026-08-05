@@ -3,8 +3,9 @@ name = "netwatch-core"
 version = "0.1.0"
 edition = "2024"
 
+# Plain rlib now. It was also a cdylib so a Python extension module could load
+# it; that binding, and the Qt app that consumed it, are gone.
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }

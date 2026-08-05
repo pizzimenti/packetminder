@@ -15,10 +15,13 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/netwatch"
 unit_name="netwatch.service"
 
 echo "==> Building (release)"
-cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p netwatch
+# The TUI comes too: an alert's "Open netwatch" button launches it, and a
+# button that cannot work is worse than no button.
+cargo build --release --manifest-path "$repo_dir/Cargo.toml" -p netwatch -p netwatch-tui
 
-echo "==> Installing binary to $bin_dir"
+echo "==> Installing binaries to $bin_dir"
 install -Dm755 "$repo_dir/target/release/netwatch" "$bin_dir/netwatch"
+install -Dm755 "$repo_dir/target/release/netwatch-tui" "$bin_dir/netwatch-tui"
 
 echo "==> Installing unit to $unit_dir"
 install -Dm644 "$crate_dir/$unit_name" "$unit_dir/$unit_name"
@@ -105,6 +108,11 @@ if [[ ! -f "$config_dir/netwatch.conf" ]]; then
 # -- Output --
 # cooldown_secs = 1800
 # notify = true
+#
+# Alerts carry an "Open netwatch" button that launches the TUI. Left empty this
+# finds a terminal emulator and runs netwatch-tui in it. Set an explicit command
+# to override, or "off" to drop the button. Split on whitespace, not a shell.
+# tui_command = konsole -e netwatch-tui
 EOF
 else
     echo "==> Keeping existing config at $config_dir/netwatch.conf"
