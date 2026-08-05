@@ -18,6 +18,7 @@
 // =============================================================================
 
 mod alert;
+mod collector;
 mod config;
 mod flows;
 mod iface;
@@ -293,6 +294,10 @@ fn replay(cfg: Config, since: &str) {
 // -- One-shot Modes -----------------------------------------------------------
 
 fn status(cfg: Config) {
+    // Taken before the sampling sleep so the drop figure below covers the same
+    // window as the interface rates.
+    let snapshot_before = collector::read();
+
     let mut detector = AsymDetector::new();
     thread::sleep(Duration::from_secs(cfg.interval_secs.clamp(2, 5)));
     detector.tick(&cfg, None);
@@ -342,6 +347,22 @@ fn status(cfg: Config) {
             }
             None => println!("\nestablished TCP sockets: could not measure (ss unavailable)"),
         }
+    }
+
+    // Exact drop volume, which the ufw log cannot give: its LOG rule is rate
+    // limited to 3/min, so the log counts its own limiter.
+    match (snapshot_before, collector::read()) {
+        (Some(before), Some(after)) => match after.drops_since(&before) {
+            Some((packets, bytes)) if after.at > before.at => println!(
+                "firewall dropped {packets} packets ({bytes} bytes) in {}s — exact",
+                after.at - before.at
+            ),
+            _ => println!("firewall drops: collector has not refreshed yet"),
+        },
+        _ => println!(
+            "firewall drops: unavailable — collector not installed \
+             (crates/netwatch/collector/install-collector.sh)"
+        ),
     }
 }
 
