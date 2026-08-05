@@ -204,6 +204,36 @@ Note that ufw rate-limits its own logging, so drop *counts* understate reality
 badly — tonight's 2.7 Mbps flood (roughly 500 packets/sec) produced only 34
 log records. Counts indicate persistence, not volume.
 
+### Do not raise the log limit to fix that
+
+The limiter is `-m limit --limit 3/min --limit-burst 10` on the `LOG` rule in
+`ufw-after-logging-input`. Raising it is the obvious move and the wrong one.
+
+ufw offers no level that unrate-limits blocked-packet logging on its own: per
+`man ufw`, `high` is "medium **without rate limiting**, plus all packets with
+rate limiting", so buying accurate drop counts also buys a log line for allowed
+traffic. On a host doing 98 Mbps that is not a tradeoff worth making.
+
+The volume the log cannot give you is already recorded exactly, for free, with
+no logging at all — every firewall rule carries a packet and byte counter:
+
+```sh
+sudo iptables -L ufw-after-input -v -n -x      # what reached the drop path
+sudo iptables -L INPUT -v -n -x | head -3      # policy DROP totals
+```
+
+Measured on this host at 7.5 hours uptime: the `LOG` rule had emitted 1212
+records, against a theoretical ceiling of ~1350 for `3/min` over that period.
+The count was set by the limiter, not by the traffic — which is the whole point.
+The policy `DROP` counter meanwhile read 1835 packets / 643,506 bytes, exactly,
+and a further 3388 broadcast packets were dropped via `ufw-skip-to-policy-input`
+without ever reaching a logging rule at all.
+
+So: the log is for **identity** — who, which port, how persistently — and 1212
+samples name a culprit perfectly well. The counters are for **volume**. Asking
+the log for volume is asking the wrong source, and no amount of raising the
+limit changes that.
+
 ## Config
 
 `~/.config/netwatch/netwatch.conf`, plain `key = value`, all keys optional. Read
