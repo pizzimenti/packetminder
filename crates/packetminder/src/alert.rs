@@ -70,7 +70,7 @@ pub fn emit(cfg: &Config, alert: &Alert) {
 /// The timestamp is redundant under systemd, which stamps every entry itself,
 /// but it keeps the line self-describing when the daemon is run by hand.
 pub fn log(message: &str) {
-    eprint!("{} {}\n", fmt_iso_local(now_epoch()), message);
+    eprintln!("{} {}", fmt_iso_local(now_epoch()), message);
 }
 
 fn notify(cfg: &Config, alert: &Alert) {
