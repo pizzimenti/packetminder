@@ -1,16 +1,20 @@
 // =============================================================================
 // packetminder — background detector for inbound traffic nothing consumes.
 //
-// packetminder's TUI and GUI answer "what are my connections doing?" by polling
-// `ss`. That is connection-oriented by construction, so it is blind to traffic
-// that never forms a connection: UDP aimed at a port with no socket has no row
-// in `ss`, no conntrack entry, and no owning process — yet it still saturates a
-// link. This daemon watches the two places such traffic *is* visible:
+// packetminder's TUI answers "what are my connections doing?" by polling `ss`.
+// That is connection-oriented by construction, so it is blind to traffic that
+// never forms a connection: UDP aimed at a port with no socket has no row in
+// `ss`, no conntrack entry, and no owning process — yet it still saturates a
+// link. This daemon watches the places such traffic *is* visible:
 //
 //   asymmetry     /proc/net/dev counters. Inbound with no matching outbound
 //                 means this host is not part of the conversation.
 //   blocked flows the kernel log. Repeated firewall drops from one source name
-//                 the culprit exactly.
+//                 the culprit exactly — and drops of this host's *own* traffic
+//                 feed a separate self-blocked detector.
+//   protocol      /proc/net/snmp. Datagrams delivered to dead ports, and
+//                 traffic a local socket wanted but could not drain.
+//   ipv6          `ip addr`. Addressing appearing where there was none.
 //
 // Written after a Sunshine host streamed 2.7 Mbps of video at this machine for
 // an unknown length of time, into a port nothing was listening on, while every
