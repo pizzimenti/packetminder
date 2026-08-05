@@ -46,6 +46,11 @@ pub struct ProtoDetector {
     /// port scan or one busy moment does not raise anything.
     no_ports_held: u64,
     overflow_held: u64,
+    /// When each condition last alerted. Without this the detector re-fired
+    /// every sustain window — one popup a minute for as long as a condition
+    /// held, where every other detector holds its tongue for `cooldown_secs`.
+    no_ports_alerted: Option<i64>,
+    overflow_alerted: Option<i64>,
 }
 
 impl Default for ProtoDetector {
@@ -60,6 +65,8 @@ impl ProtoDetector {
             last: None,
             no_ports_held: 0,
             overflow_held: 0,
+            no_ports_alerted: None,
+            overflow_alerted: None,
         }
     }
 
@@ -71,7 +78,12 @@ impl ProtoDetector {
             rcvbuf_errors: counter("Udp.RcvbufErrors"),
             listen_drops: counter("TcpExt.ListenDrops") + counter("TcpExt.ListenOverflows"),
         };
+        self.evaluate(cfg, now, current)
+    }
 
+    /// The judgement half of `tick`, split from the sampling half so tests can
+    /// drive it with synthetic counters and a synthetic clock.
+    fn evaluate(&mut self, cfg: &Config, now: i64, current: Sample) -> Vec<Alert> {
         let Some(prev) = self.last.replace(current) else {
             // First tick has nothing to subtract from.
             return Vec::new();
@@ -86,10 +98,15 @@ impl ProtoDetector {
         let mut alerts = Vec::new();
         let step = cfg.interval_secs;
 
+        let cooled = |alerted: Option<i64>| {
+            alerted.is_none_or(|at| now - at >= cfg.cooldown_secs as i64)
+        };
+
         if no_ports_rate >= cfg.noports_min_rate {
             self.no_ports_held += step;
-            if self.no_ports_held >= cfg.proto_sustain_secs {
+            if self.no_ports_held >= cfg.proto_sustain_secs && cooled(self.no_ports_alerted) {
                 self.no_ports_held = 0;
+                self.no_ports_alerted = Some(now);
                 alerts.push(no_listener_alert(no_ports_rate, cfg.proto_sustain_secs));
             }
         } else {
@@ -98,8 +115,9 @@ impl ProtoDetector {
 
         if overflow_rate >= cfg.rcvbuf_min_rate {
             self.overflow_held += step;
-            if self.overflow_held >= cfg.proto_sustain_secs {
+            if self.overflow_held >= cfg.proto_sustain_secs && cooled(self.overflow_alerted) {
                 self.overflow_held = 0;
+                self.overflow_alerted = Some(now);
                 alerts.push(overflow_alert(overflow_rate, cfg.proto_sustain_secs));
             }
         } else {
@@ -123,7 +141,8 @@ fn no_listener_alert(rate: f64, held: u64) -> Alert {
         ),
         detail: "Counted by Udp.NoPorts in /proc/net/snmp, which unlike the firewall log \
                  also covers traffic ufw allows through to a dead port. To see who is \
-                 sending it: sudo tcpdump -nn 'udp and icmp[icmptype] != icmp-unreach'"
+                 sending it: sudo tcpdump -nn udp, and look for destination ports that \
+                 `ss -uan` shows nothing bound to."
             .to_string(),
         urgency: "normal",
     }
@@ -248,5 +267,70 @@ mod tests {
             "Udp.NoPorts missing from /proc/net/snmp"
         );
         assert!(all.contains_key("Udp.InDatagrams"));
+    }
+
+    /// Drive the detector with a sustained condition and a synthetic clock.
+    fn sample(at: i64, no_ports: u64) -> Sample {
+        Sample {
+            at,
+            no_ports,
+            rcvbuf_errors: 0,
+            listen_drops: 0,
+        }
+    }
+
+    #[test]
+    fn a_sustained_condition_alerts_once_per_cooldown_not_once_per_minute() {
+        let cfg = Config {
+            interval_secs: 10,
+            noports_min_rate: 5.0,
+            proto_sustain_secs: 60,
+            cooldown_secs: 1800,
+            ..Config::default()
+        };
+        let mut d = ProtoDetector::new();
+        let base = 1_785_900_000;
+
+        // 100 datagrams every 10s tick is 10/s, well over the 5/s threshold.
+        // Run 200 ticks: 1990 seconds of sustained condition.
+        let mut fired = 0;
+        for i in 0..200 {
+            let at = base + i * 10;
+            let alerts = d.evaluate(&cfg, at, sample(at, (i as u64) * 100));
+            fired += alerts.len();
+        }
+
+        // First alert once sustain is reached at t=+60. The second cannot come
+        // before +1860 (cooldown measured from the first), and does, because
+        // the sustain stays banked while the cooldown holds. 1990s of condition
+        // is exactly 2 alerts — not the ~32 the pre-cooldown behaviour gave.
+        assert_eq!(fired, 2, "cooldown must gate re-alerts, not just sustain");
+    }
+
+    #[test]
+    fn a_condition_that_stops_resets_the_sustain_window() {
+        let cfg = Config {
+            interval_secs: 10,
+            noports_min_rate: 5.0,
+            proto_sustain_secs: 60,
+            ..Config::default()
+        };
+        let mut d = ProtoDetector::new();
+        let base = 1_785_900_000;
+
+        // Five hot ticks (50s held) — just short of the 60s sustain.
+        for i in 0..5 {
+            let at = base + i * 10;
+            assert!(d.evaluate(&cfg, at, sample(at, (i as u64) * 100)).is_empty());
+        }
+        // One quiet tick resets the run...
+        let at = base + 50;
+        assert!(d.evaluate(&cfg, at, sample(at, 400)).is_empty());
+        // ...so five more hot ticks still do not reach sustain.
+        for i in 6..11 {
+            let at = base + i * 10;
+            let alerts = d.evaluate(&cfg, at, sample(at, (i as u64) * 100));
+            assert!(alerts.is_empty(), "sustain must restart after a quiet tick");
+        }
     }
 }
