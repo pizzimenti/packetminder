@@ -137,11 +137,16 @@ fn shares_prefix(a: &IpAddr, b: &IpAddr, prefix_len: u8) -> bool {
 }
 
 fn bits_match(a: &[u8], b: &[u8], prefix_len: u8) -> bool {
+    // Refuse a prefix wider than the address rather than guess. The old guard
+    // checked only the whole-byte count, so a prefix like /36 against IPv4 —
+    // whole == a.len() with bits left over — walked past the end of the array.
+    // parse_cidr validates today, but this must not be one refactor away from a
+    // panic.
+    if prefix_len as usize > a.len() * 8 {
+        return false;
+    }
     let whole = (prefix_len / 8) as usize;
     let leftover = prefix_len % 8;
-    if whole > a.len() {
-        return false; // nonsense prefix length; refuse rather than guess
-    }
     if a[..whole] != b[..whole] {
         return false;
     }
@@ -308,6 +313,21 @@ mod tests {
         // 10.3.x as v4 bytes must not match anything in a v6 comparison.
         let n = net();
         assert!(!n.is_on_link(&parse_ip("::ffff:10.3.59.7").unwrap()));
+    }
+
+    #[test]
+    fn an_oversized_prefix_is_refused_not_a_panic() {
+        // /36 against a 4-byte address: whole bytes fit but the leftover bits
+        // index past the end. Must answer false, never panic.
+        let a = parse_ip("10.3.153.246").unwrap();
+        let b = parse_ip("10.3.153.247").unwrap();
+        assert!(!shares_prefix(&a, &b, 36));
+        assert!(shares_prefix(&a, &b, 32 - 8)); // sanity: /24 still matches
+        // Exactly full-width still works for both families.
+        assert!(shares_prefix(&a, &a, 32));
+        let v6 = parse_ip("fe80::1").unwrap();
+        assert!(shares_prefix(&v6, &v6, 128));
+        assert!(!shares_prefix(&v6, &v6, 129));
     }
 
     #[test]
