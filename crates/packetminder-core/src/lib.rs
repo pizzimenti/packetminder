@@ -2,7 +2,7 @@
 // packetminder-core — Business logic for monitoring active TCP connections.
 //
 // Provides connection polling (via `ss`), whois ISP lookups, speed tracking,
-// and formatting helpers. Used by both the TUI and Qt GUI frontends.
+// and formatting helpers. The TUI is a thin display layer over this.
 // =============================================================================
 
 use std::{

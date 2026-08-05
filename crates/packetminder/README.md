@@ -294,7 +294,8 @@ was a duplicate that could grow without bound. The daemon writes nothing to
 disk at all now, which is why the unit needs no `StateDirectory=`.
 
 Retention is journald's, set in `/etc/systemd/journald.conf.d/limits.conf`
-(`SystemMaxUse=200M`, currently about three weeks of history on this machine).
+(`SystemMaxUse=2G` with `MaxRetentionSec=1month` on this machine — raised from
+200M, which was evicting kernel history that `--replay` depends on).
 
 ## The collector (optional, privileged)
 
