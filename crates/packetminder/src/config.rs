@@ -11,6 +11,9 @@ use std::{collections::HashMap, env, fs, path::PathBuf};
 
 // -- Data Structures ----------------------------------------------------------
 
+// Clone: enrichment threads carry a copy so re-notification does not need to
+// borrow the detector loop's instance across a thread boundary.
+#[derive(Clone)]
 pub struct Config {
     /// Seconds between interface samples.
     pub interval_secs: u64,

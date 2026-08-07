@@ -27,6 +27,7 @@ use crate::config::Config;
 
 // -- Data Structures ----------------------------------------------------------
 
+#[derive(Clone)]
 pub struct Alert {
     /// Machine-readable category, e.g. "asymmetric-inbound".
     pub kind: &'static str,
@@ -279,13 +280,17 @@ fn chosen_name(ip: &str) -> Option<String> {
 /// The address is always kept alongside the name. A name alone is ambiguous
 /// after a DHCP reshuffle, and the address is what you need to write a firewall
 /// rule or start a capture.
-pub fn device_label(ip: &str) -> String {
+///
+/// Cache-only: consults the name cache but never shells out to a resolver, so
+/// it is safe on the detector loop. The enrichment threads are what fill the
+/// cache; until one has, a source shows as its vendor or bare address.
+pub fn device_label_cached(ip: &str) -> String {
     // A name you chose beats anything that can be discovered, always.
     if let Some(name) = chosen_name(ip) {
         return format!("{name} ({ip})");
     }
 
-    let named = hostname_for(ip);
+    let named = hostname_cached(ip);
     let short = named
         .as_deref()
         .and_then(|n| n.split('.').next())
@@ -317,12 +322,30 @@ pub fn device_label(ip: &str) -> String {
 /// the vendor behind the MAC — which is what tells you what the thing actually
 /// is. Collapsing them into one label, as this used to, always threw away
 /// whichever half the reader happened to need.
+///
+/// This variant resolves: it may wait on `getent` (2s cap). Keep it off the
+/// detector loop — that is what `identity_cached` is for.
 pub fn identity(ip: &str) -> (String, Option<String>) {
-    let hostname = hostname_for(ip)
+    identity_at(ip, true)
+}
+
+/// `identity`, but consulting caches only — never a resolver. Safe anywhere.
+pub fn identity_cached(ip: &str) -> (String, Option<String>) {
+    identity_at(ip, false)
+}
+
+fn identity_at(ip: &str, resolve: bool) -> (String, Option<String>) {
+    let fqdn = if resolve {
+        hostname_for(ip)
+    } else {
+        hostname_cached(ip)
+    };
+    let hostname = fqdn
+        .as_deref()
         .and_then(|n| n.split('.').next().map(str::to_string))
         .filter(|n| !n.is_empty());
 
-    let primary = match hostname_for(ip) {
+    let primary = match &fqdn {
         Some(fqdn) => format!("{fqdn} ({ip})"),
         None => ip.to_string(),
     };
@@ -521,6 +544,19 @@ pub fn hostname_for(ip: &str) -> Option<String> {
     name
 }
 
+/// The cached hostname, or None — never a lookup. A miss here is not "no
+/// name"; it is "not resolved yet", which the enrichment path fixes moments
+/// later.
+fn hostname_cached(ip: &str) -> Option<String> {
+    let cache = name_cache().lock().ok()?;
+    let (name, at) = cache.get(ip)?;
+    if now_epoch() - at < NAME_TTL_SECS {
+        name.clone()
+    } else {
+        None
+    }
+}
+
 /// Context for a source address beyond its name: which network it sits on, and
 /// who operates it. The name itself is already in the alert title.
 ///
@@ -529,6 +565,17 @@ pub fn hostname_for(ip: &str) -> Option<String> {
 /// misleading answer — it names whoever owns the allocation, so a machine on
 /// the same switch gets reported as an ISP on the far side of the internet.
 pub fn describe_source(ip: &str, nearby: bool) -> String {
+    describe_source_at(ip, nearby, true)
+}
+
+/// `describe_source` without the whois: an internet source is just "internet"
+/// until an enrichment thread has asked. The LAN path is unchanged — the
+/// neighbour table is a local netlink dump, not a network wait.
+pub fn describe_source_cached(ip: &str, nearby: bool) -> String {
+    describe_source_at(ip, nearby, false)
+}
+
+fn describe_source_at(ip: &str, nearby: bool, resolve: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if nearby {
@@ -540,7 +587,7 @@ pub fn describe_source(ip: &str, nearby: bool) -> String {
         }
     } else {
         parts.push("internet".to_string());
-        if let Some(isp) = whois_org(ip, 5) {
+        if resolve && let Some(isp) = whois_org(ip, 5) {
             parts.push(isp);
         }
     }

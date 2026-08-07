@@ -28,8 +28,8 @@ use std::{
 
 use crate::{
     alert::{
-        self, Alert, describe_source, device_label, fmt_bytes, fmt_duration, identity, is_private,
-        now_epoch, port_in_use,
+        self, Alert, describe_source, describe_source_cached, device_label_cached, fmt_bytes,
+        fmt_duration, identity, identity_cached, is_private, now_epoch, port_in_use,
     },
     config::Config,
     local::{LocalNet, parse_ip},
@@ -110,6 +110,28 @@ pub struct FlowTracker {
     /// Records this detector rejects are not thrown away — traffic this host
     /// sends and then drops is a different problem, judged on its own terms.
     selfblock: SelfBlockTracker,
+    /// Resolve names while building alerts, instead of emitting immediately
+    /// and enriching in the background. Only `--replay` wants this: it is
+    /// offline, blocking is free there, and it must never spawn threads that
+    /// would raise real notifications about historical traffic.
+    resolve_inline: bool,
+}
+
+/// Everything an alert says about a flow, copied out of the tracker so a
+/// background thread can rebuild the alert once names have resolved — the
+/// tracker itself cannot cross a thread boundary, and should not.
+#[derive(Clone)]
+struct FlowFacts {
+    src: String,
+    proto_lower: String,
+    dport: u16,
+    sport: u16,
+    total: u64,
+    bytes: u64,
+    iface: String,
+    duration: String,
+    listening: bool,
+    nearby: bool,
 }
 
 // -- Journal Follower ---------------------------------------------------------
@@ -208,7 +230,15 @@ impl FlowTracker {
             local,
             skipped: SkipCounts::default(),
             selfblock: SelfBlockTracker::new(),
+            resolve_inline: false,
         }
+    }
+
+    /// Resolve names while building alerts rather than in the background.
+    /// `--replay` only: blocking is free offline, and replay must never spawn
+    /// enrichment threads that raise real popups about historical traffic.
+    pub fn resolve_names_inline(&mut self) {
+        self.resolve_inline = true;
     }
 
     pub fn skipped(&self) -> SkipCounts {
@@ -318,7 +348,7 @@ impl FlowTracker {
                         alert::log(
                             &format!(
                                 "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
-                                device_label(&key.src),
+                                device_label_cached(&key.src),
                                 key.proto.to_lowercase(),
                                 key.dport,
                                 fmt_duration((state.last - state.first).max(0) as u64),
@@ -346,7 +376,18 @@ impl FlowTracker {
             }
 
             state.alerted_at = Some(now);
-            alerts.push(build_alert(key, state, now, &self.local));
+
+            let facts = gather_facts(key, state, now, &self.local);
+            if self.resolve_inline {
+                alerts.push(compose_alert(&facts, true));
+            } else {
+                // Emit with whatever the caches hold right now — the loop must
+                // not wait on getent or whois. A background thread resolves,
+                // rebuilds, and replaces the popup through its dedup key.
+                let bare = compose_alert(&facts, false);
+                spawn_enrichment(cfg.clone(), facts, bare.clone());
+                alerts.push(bare);
+            }
         }
 
         for key in finished {
@@ -376,7 +417,7 @@ impl FlowTracker {
             .map(|(k, s)| {
                 format!(
                     "{} → {}/{} ({} drops)",
-                    device_label(&k.src),
+                    device_label_cached(&k.src),
                     k.proto.to_lowercase(),
                     k.dport,
                     s.times.len()
@@ -388,22 +429,41 @@ impl FlowTracker {
     }
 }
 
-fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> Alert {
-    let proto = key.proto.to_lowercase();
-    let duration = fmt_duration((now - state.first).max(0) as u64);
-    let listening = port_in_use(&key.proto, key.dport);
+fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> FlowFacts {
+    FlowFacts {
+        src: key.src.clone(),
+        proto_lower: key.proto.to_lowercase(),
+        dport: key.dport,
+        sport: state.sport,
+        total: state.total,
+        bytes: state.bytes,
+        iface: state.iface.clone(),
+        duration: fmt_duration((now - state.first).max(0) as u64),
+        listening: port_in_use(&key.proto, key.dport),
+        // "Not the internet" is two conditions, and both are needed. On a
+        // subnet this host is attached to is the only one that means anything
+        // under IPv6. Private v4 space is the fallback: it still holds when
+        // address discovery has failed, and it covers a LAN host reached
+        // through a router.
+        nearby: parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip))
+            || is_private(&key.src),
+    }
+}
 
-    // "Not the internet" is two conditions, and both are needed. On a subnet
-    // this host is attached to is the only one that means anything under IPv6.
-    // Private v4 space is the fallback: it still holds when address discovery
-    // has failed, and it covers a LAN host reached through a router.
-    let nearby =
-        parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(&key.src);
+/// Build the alert from gathered facts. With `resolve` the lookups may wait on
+/// the network; without it only caches are consulted, so it is safe on the
+/// detector loop.
+fn compose_alert(facts: &FlowFacts, resolve: bool) -> Alert {
+    let proto = &facts.proto_lower;
 
     // Line one is what we worked out the device is; line two is what it did.
     // The raw hostname and address live in the title, because that is the half
     // you act on.
-    let (who, derived) = identity(&key.src);
+    let (who, derived) = if resolve {
+        identity(&facts.src)
+    } else {
+        identity_cached(&facts.src)
+    };
 
     let mut body = String::new();
     if let Some(d) = &derived {
@@ -412,10 +472,10 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     }
     body.push_str(&format!(
         "{} drops over {} on {}, still going. {}",
-        state.total,
-        duration,
-        state.iface,
-        if listening {
+        facts.total,
+        facts.duration,
+        facts.iface,
+        if facts.listening {
             "Something IS listening — the firewall is blocking it."
         } else {
             "Nothing is listening."
@@ -427,14 +487,19 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     let mut detail = format!(
         "{} logged. ufw rate-limits its own logging, so the count measures \
          persistence, not volume.",
-        fmt_bytes(state.bytes),
+        fmt_bytes(facts.bytes),
     );
-    if !listening {
+    if !facts.listening {
         detail.push_str(" The sender is getting no feedback because the drop is silent.");
     }
-    detail.push_str(&format!(" Source: {}", describe_source(&key.src, nearby)));
-    if state.sport != 0 {
-        detail.push_str(&format!(" from {proto}/{}", state.sport));
+    let source = if resolve {
+        describe_source(&facts.src, facts.nearby)
+    } else {
+        describe_source_cached(&facts.src, facts.nearby)
+    };
+    detail.push_str(&format!(" Source: {source}"));
+    if facts.sport != 0 {
+        detail.push_str(&format!(" from {proto}/{}", facts.sport));
     }
 
     // Volume cannot be read off a rate-limited log, so urgency comes from what
@@ -442,18 +507,38 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     // transmitting into a black hole are both somebody's mistake worth waking
     // up for. The internet knocking on a closed port all day is just the
     // internet, and does not get to interrupt anyone.
-    let urgency = if listening || nearby { "critical" } else { "normal" };
+    let urgency = if facts.listening || facts.nearby { "critical" } else { "normal" };
 
     Alert {
         kind: "blocked-flow",
         // Keyed on the address and never the resolved name, so that the popup
         // still replaces its predecessor when a name starts or stops resolving.
-        key: format!("flow-{}-{}-{}", key.src, proto, key.dport),
-        title: format!("{who} — blocked {proto}/{}", key.dport),
+        key: format!("flow-{}-{}-{}", facts.src, proto, facts.dport),
+        title: format!("{who} — blocked {proto}/{}", facts.dport),
         body,
         detail,
         urgency,
     }
+}
+
+/// Resolve names off the loop, then re-emit if resolution changed anything.
+///
+/// The re-emit reuses the alert's dedup key, so the popup on screen updates in
+/// place rather than stacking; the journal gets a second, richer line. When
+/// the caches already held everything — the common case for a repeat offender
+/// — the rebuilt alert is identical and nothing is emitted at all.
+fn spawn_enrichment(cfg: Config, facts: FlowFacts, bare: Alert) {
+    thread::spawn(move || {
+        // Let the immediate alert land first, so replacement order is fixed.
+        thread::sleep(Duration::from_millis(300));
+        let enriched = compose_alert(&facts, true);
+        if enriched.title != bare.title
+            || enriched.body != bare.body
+            || enriched.detail != bare.detail
+        {
+            let _ = alert::emit(&cfg, &enriched);
+        }
+    });
 }
 
 // -- Timestamp Parsing --------------------------------------------------------
@@ -529,8 +614,15 @@ mod tests {
 
     /// A tracker that believes it owns this machine's addresses, so tests never
     /// depend on whatever the host running them actually has configured.
+    ///
+    /// Inline resolution, for the same reason --replay uses it: the background
+    /// path spawns threads that end in notify-send, and a test suite that
+    /// raises desktop popups has failed at being a test suite.
     fn tracker() -> FlowTracker {
-        FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246/16"], &["10.3.255.255"]))
+        let mut t =
+            FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246/16"], &["10.3.255.255"]));
+        t.resolve_names_inline();
+        t
     }
 
     #[test]

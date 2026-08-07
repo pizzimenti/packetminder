@@ -265,6 +265,9 @@ fn replay(cfg: Config, since: &str) {
 
     // Feed events through the tracker at their original timestamps.
     let mut tracker = FlowTracker::new();
+    // Replay is offline: blocking on name resolution is free, and background
+    // enrichment threads would raise real popups about historical traffic.
+    tracker.resolve_names_inline();
     let mut alerts: Vec<(i64, Alert)> = Vec::new();
     for event in events {
         let ts = event.ts;
