@@ -191,14 +191,14 @@ impl Config {
 
             let ok = match key {
                 "interval_secs" => set_u64(&mut cfg.interval_secs, value),
-                "rx_floor_bps" => set_f64(&mut cfg.rx_floor_bps, value),
-                "asym_ratio" => set_f64(&mut cfg.asym_ratio, value),
+                "rx_floor_bps" => set_f64_at_least(&mut cfg.rx_floor_bps, value, 0.0),
+                "asym_ratio" => set_ratio(&mut cfg.asym_ratio, value),
                 "asym_sustain_secs" => set_u64(&mut cfg.asym_sustain_secs, value),
                 "socket_corroboration" => {
                     cfg.socket_corroboration = matches!(value, "1" | "true" | "yes" | "on");
                     true
                 }
-                "socket_account_ratio" => set_f64(&mut cfg.socket_account_ratio, value),
+                "socket_account_ratio" => set_ratio(&mut cfg.socket_account_ratio, value),
                 "ignore_interfaces" => {
                     cfg.ignore_interfaces = value
                         .split(',')
@@ -242,8 +242,8 @@ impl Config {
                     cfg.watch_proto = matches!(value, "1" | "true" | "yes" | "on");
                     true
                 }
-                "noports_min_rate" => set_f64(&mut cfg.noports_min_rate, value),
-                "rcvbuf_min_rate" => set_f64(&mut cfg.rcvbuf_min_rate, value),
+                "noports_min_rate" => set_f64_at_least(&mut cfg.noports_min_rate, value, 0.0),
+                "rcvbuf_min_rate" => set_f64_at_least(&mut cfg.rcvbuf_min_rate, value, 0.0),
                 "proto_sustain_secs" => set_u64(&mut cfg.proto_sustain_secs, value),
                 // `name <mac|ip> = <label>`, repeatable. A MAC survives a DHCP
                 // reshuffle; an address is there for devices that never appear
@@ -274,7 +274,8 @@ impl Config {
 
             if !ok {
                 eprintln!(
-                    "{}:{}: `{key}` has an unparseable value `{value}`, keeping default",
+                    "{}:{}: `{key}` has an unparseable or out-of-range value `{value}`, \
+                     keeping default",
                     path.display(),
                     lineno + 1
                 );
@@ -373,12 +374,59 @@ fn set_usize(slot: &mut usize, value: &str) -> bool {
     }
 }
 
-fn set_f64(slot: &mut f64, value: &str) -> bool {
-    match value.parse() {
-        Ok(v) => {
+// -- Tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ratios_reject_everything_outside_the_unit_interval() {
+        let mut slot = 0.5;
+        assert!(set_ratio(&mut slot, "0.02"));
+        assert_eq!(slot, 0.02);
+
+        for bad in ["-1", "1.5", "NaN", "inf", "-inf", "banana"] {
+            assert!(!set_ratio(&mut slot, bad), "{bad} must be refused");
+            assert_eq!(slot, 0.02, "{bad} must not overwrite the previous value");
+        }
+        assert!(set_ratio(&mut slot, "0"));
+        assert!(set_ratio(&mut slot, "1"));
+    }
+
+    #[test]
+    fn magnitudes_reject_negatives_and_nan() {
+        let mut slot = 5.0;
+        assert!(set_f64_at_least(&mut slot, "1000000", 0.0));
+        assert_eq!(slot, 1_000_000.0);
+        for bad in ["-1", "NaN", "-inf", "x"] {
+            assert!(!set_f64_at_least(&mut slot, bad, 0.0), "{bad} must be refused");
+        }
+        assert_eq!(slot, 1_000_000.0);
+    }
+}
+
+/// A fraction: finite and inside [0, 1]. `asym_ratio = -1` parses fine as a
+/// float and then silently disables the detector it configures, which is the
+/// kind of typo that should be a warning, not a behaviour.
+fn set_ratio(slot: &mut f64, value: &str) -> bool {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
             *slot = v;
             true
         }
-        Err(_) => false,
+        _ => false,
+    }
+}
+
+/// A magnitude: finite and at least `min`. NaN fails every comparison it later
+/// feeds, which reads as "never alert" — refuse it here instead.
+fn set_f64_at_least(slot: &mut f64, value: &str, min: f64) -> bool {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= min => {
+            *slot = v;
+            true
+        }
+        _ => false,
     }
 }
