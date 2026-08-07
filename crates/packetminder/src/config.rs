@@ -278,7 +278,7 @@ impl Config {
             if !ok {
                 eprintln!(
                     "{}:{}: `{key}` has an unparseable or out-of-range value `{value}`, \
-                     keeping default",
+                     keeping the previous value",
                     path.display(),
                     lineno + 1
                 );
@@ -427,7 +427,9 @@ mod tests {
         let mut slot = 5.0;
         assert!(set_f64_at_least(&mut slot, "1000000", 0.0));
         assert_eq!(slot, 1_000_000.0);
-        for bad in ["-1", "NaN", "-inf", "x"] {
+        // "inf" is the case that actually needs is_finite(): -inf and -1 fail
+        // the minimum check on their own.
+        for bad in ["-1", "NaN", "inf", "-inf", "x"] {
             assert!(!set_f64_at_least(&mut slot, bad, 0.0), "{bad} must be refused");
         }
         assert_eq!(slot, 1_000_000.0);

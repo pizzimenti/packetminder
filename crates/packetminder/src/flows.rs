@@ -21,7 +21,10 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader},
     process::{Command, Stdio},
-    sync::mpsc::{Receiver, channel},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, channel},
+    },
     thread,
     time::Duration,
 };
@@ -521,14 +524,39 @@ fn compose_alert(facts: &FlowFacts, resolve: bool) -> Alert {
     }
 }
 
+/// Enrichment threads in flight, and the most that may be. A port sweep can
+/// push many distinct flows over the alert threshold in one tick; each would
+/// otherwise spawn a thread that waits on getent and whois.
+static ENRICHERS: AtomicUsize = AtomicUsize::new(0);
+const MAX_ENRICHERS: usize = 8;
+
+/// Frees the slot however the thread ends — a panicking lookup must not leak
+/// capacity until nothing can ever enrich again.
+struct EnricherSlot;
+
+impl Drop for EnricherSlot {
+    fn drop(&mut self) {
+        ENRICHERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Resolve names off the loop, then re-emit if resolution changed anything.
 ///
 /// The re-emit reuses the alert's dedup key, so the popup on screen updates in
 /// place rather than stacking; the journal gets a second, richer line. When
 /// the caches already held everything — the common case for a repeat offender
 /// — the rebuilt alert is identical and nothing is emitted at all.
+///
+/// Bounded: past MAX_ENRICHERS concurrent workers the enrichment is skipped,
+/// not queued. The immediate alert was already complete when it was emitted;
+/// enrichment is a refinement, and refinements do not get to exhaust threads.
 fn spawn_enrichment(cfg: Config, facts: FlowFacts, bare: Alert) {
+    if ENRICHERS.fetch_add(1, Ordering::SeqCst) >= MAX_ENRICHERS {
+        ENRICHERS.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
     thread::spawn(move || {
+        let _slot = EnricherSlot;
         // Let the immediate alert land first, so replacement order is fixed.
         thread::sleep(Duration::from_millis(300));
         let enriched = compose_alert(&facts, true);

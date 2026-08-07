@@ -241,6 +241,20 @@ fn vendor_cache() -> &'static VendorCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How long a whois answer is reused. Allocation ownership does not move on
+/// DHCP timescales, so this is generous — and it is what lets the cached
+/// describe_source include the ISP, which in turn is what makes an enrichment
+/// rebuild identical to the immediate alert for a repeat offender.
+const WHOIS_TTL_SECS: i64 = 3600;
+
+/// ip → (org, when). Negatives cached too, same argument as the name cache.
+type WhoisCache = Mutex<HashMap<String, (Option<String>, i64)>>;
+
+fn whois_cache() -> &'static WhoisCache {
+    static CACHE: OnceLock<WhoisCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Names from the config, keyed by lowercase MAC or by address.
 static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
@@ -587,7 +601,12 @@ fn describe_source_at(ip: &str, nearby: bool, resolve: bool) -> String {
         }
     } else {
         parts.push("internet".to_string());
-        if resolve && let Some(isp) = whois_org(ip, 5) {
+        let isp = if resolve {
+            whois_org(ip, 5)
+        } else {
+            whois_org_cached(ip)
+        };
+        if let Some(isp) = isp {
             parts.push(isp);
         }
     }
@@ -644,34 +663,85 @@ fn neighbour_mac(ip: &str) -> Option<String> {
     None
 }
 
-fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
-    let query = ip.to_string();
-    with_timeout(timeout_secs, move || {
-        let text = Command::new("whois")
-            .arg(&query)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())?;
+/// The cached whois answer, or None — never a lookup.
+fn whois_org_cached(ip: &str) -> Option<String> {
+    let cache = whois_cache().lock().ok()?;
+    let (org, at) = cache.get(ip)?;
+    if now_epoch() - at < WHOIS_TTL_SECS {
+        org.clone()
+    } else {
+        None
+    }
+}
 
-        for prefix in [
-            "OrgName:",
-            "org-name:",
-            "netname:",
-            "descr:",
-            "Organization:",
-        ] {
-            for line in text.lines() {
-                if let Some(rest) = line.trim().strip_prefix(prefix) {
-                    let name = rest.trim();
-                    if !name.is_empty() {
-                        return Some(name.to_string());
-                    }
+fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
+    if let Ok(cache) = whois_cache().lock()
+        && let Some((org, at)) = cache.get(ip)
+        && now_epoch() - at < WHOIS_TTL_SECS
+    {
+        return org.clone();
+    }
+
+    let org = whois_org_uncached(ip, timeout_secs);
+    if let Ok(mut cache) = whois_cache().lock() {
+        cache.insert(ip.to_string(), (org.clone(), now_epoch()));
+    }
+    org
+}
+
+/// whois with a hard deadline: killed and reaped on expiry, stdout drained
+/// concurrently so a chatty registry cannot block the child on a full pipe.
+/// Abandoning the wait, as the old with_timeout wrapper did, left a whois that
+/// never exits running forever.
+fn whois_org_uncached(ip: &str, timeout_secs: u64) -> Option<String> {
+    let mut child = Command::new("whois")
+        .arg(ip)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let (tx, rx) = channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = tx.send(text);
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(_) => return None,
+        }
+    }
+    let text = rx.recv_timeout(Duration::from_secs(1)).ok()?;
+
+    for prefix in [
+        "OrgName:",
+        "org-name:",
+        "netname:",
+        "descr:",
+        "Organization:",
+    ] {
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix(prefix) {
+                let name = rest.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
                 }
             }
         }
-        None
-    })
-    .flatten()
+    }
+    None
 }
 
 /// Run `f` on a helper thread, giving up after `secs`.

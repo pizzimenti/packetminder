@@ -7,10 +7,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    process::Command,
+    io::Read as _,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 // -- Constants ----------------------------------------------------------------
@@ -172,6 +173,16 @@ impl App {
     pub fn spawn_isp_lookup(&mut self, remote: &str) {
         let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote).to_string();
 
+        // The cache is checked before anything is spawned. Short-lived
+        // connections to one host reappear constantly, and without this every
+        // reappearance re-ran whois for an answer already in hand — failures
+        // included, since "?" is cached too.
+        if let Ok(cache) = self.isp_cache.lock()
+            && cache.contains_key(&ip)
+        {
+            return;
+        }
+
         if let Ok(mut pending) = self.pending_lookups.lock() {
             if !pending.insert(ip.clone()) {
                 return; // already in flight
@@ -184,9 +195,6 @@ impl App {
         let pending = Arc::clone(&self.pending_lookups);
         thread::spawn(move || {
             let isp = run_whois(&ip);
-            // Failures are cached as "?" too — retrying every poll would hammer
-            // whois servers whenever one is unreachable. The cache, not the
-            // pending set, is what prevents lookup storms.
             if let Ok(mut cache) = cache.lock() {
                 cache.insert(ip.clone(), isp);
             }
@@ -220,27 +228,54 @@ impl App {
 /// for the duration.
 const WHOIS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Run `whois <ip>` with a timeout, extracting the ISP/organization name.
+/// Run `whois <ip>` with a hard deadline, extracting the ISP/organization
+/// name. "?" on any failure, timeout included.
 ///
-/// On timeout the answer is "?" and the inner thread is left to finish and be
-/// discarded — bounded by however long whois itself takes to give up, which is
-/// the same bargain the daemon's lookup timeouts strike.
+/// The child is killed and reaped at the deadline — merely abandoning the wait
+/// leaves a whois that never exits running forever, and a retried IP could
+/// stack another one behind it. A separate thread drains stdout continuously,
+/// so a chatty registry cannot fill the pipe, block the child, and turn a slow
+/// answer into a timeout.
 pub fn run_whois(ip: &str) -> String {
-    let query = ip.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let _ = tx.send(run_whois_blocking(&query));
-    });
-    rx.recv_timeout(WHOIS_TIMEOUT).unwrap_or_else(|_| "?".into())
-}
-
-fn run_whois_blocking(ip: &str) -> String {
-    let output = Command::new("whois").arg(ip).output();
-    let output = match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return "?".into(),
+    let Ok(mut child) = Command::new("whois")
+        .arg(ip)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return "?".into();
     };
 
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+    }
+
+    let deadline = Instant::now() + WHOIS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "?".into();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(_) => return "?".into(),
+        }
+    }
+
+    let Ok(output) = rx.recv_timeout(Duration::from_secs(1)) else {
+        return "?".into();
+    };
+    parse_whois_org(&output)
+}
+
+fn parse_whois_org(output: &str) -> String {
     for prefix in ["OrgName:", "org-name:", "netname:", "descr:", "Organization:"] {
         for line in output.lines() {
             let trimmed = line.trim();
