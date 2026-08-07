@@ -118,6 +118,11 @@ pub struct FlowTracker {
     /// offline, blocking is free there, and it must never spawn threads that
     /// would raise real notifications about historical traffic.
     resolve_inline: bool,
+    /// Enrichment waiting for its bare alert to be emitted first. Spawning at
+    /// alert-build time raced the emit: a fast resolution could land the
+    /// enriched popup first, only for the bare one to replace it through the
+    /// same dedup key. The caller drains this *after* emitting.
+    pending_enrich: Vec<(FlowFacts, Alert)>,
 }
 
 /// Everything an alert says about a flow, copied out of the tracker so a
@@ -234,6 +239,7 @@ impl FlowTracker {
             skipped: SkipCounts::default(),
             selfblock: SelfBlockTracker::new(),
             resolve_inline: false,
+            pending_enrich: Vec::new(),
         }
     }
 
@@ -242,6 +248,17 @@ impl FlowTracker {
     /// enrichment threads that raise real popups about historical traffic.
     pub fn resolve_names_inline(&mut self) {
         self.resolve_inline = true;
+    }
+
+    /// Start background enrichment for alerts the caller has now emitted.
+    ///
+    /// Separate from tick() on purpose: the enriched re-emit replaces the bare
+    /// popup through the dedup key, and replacement only works if the bare one
+    /// is on screen first. Spawning inside tick() raced that ordering.
+    pub fn spawn_pending_enrichment(&mut self, cfg: &Config) {
+        for (facts, bare) in self.pending_enrich.drain(..) {
+            spawn_enrichment(cfg.clone(), facts, bare);
+        }
     }
 
     pub fn skipped(&self) -> SkipCounts {
@@ -385,10 +402,11 @@ impl FlowTracker {
                 alerts.push(compose_alert(&facts, true));
             } else {
                 // Emit with whatever the caches hold right now — the loop must
-                // not wait on getent or whois. A background thread resolves,
-                // rebuilds, and replaces the popup through its dedup key.
+                // not wait on getent or whois. Enrichment is queued, not
+                // spawned: it starts only once the caller has actually emitted
+                // this alert, via spawn_pending_enrichment.
                 let bare = compose_alert(&facts, false);
-                spawn_enrichment(cfg.clone(), facts, bare.clone());
+                self.pending_enrich.push((facts, bare.clone()));
                 alerts.push(bare);
             }
         }
@@ -557,8 +575,6 @@ fn spawn_enrichment(cfg: Config, facts: FlowFacts, bare: Alert) {
     }
     thread::spawn(move || {
         let _slot = EnricherSlot;
-        // Let the immediate alert land first, so replacement order is fixed.
-        thread::sleep(Duration::from_millis(300));
         let enriched = compose_alert(&facts, true);
         if enriched.title != bare.title
             || enriched.body != bare.body

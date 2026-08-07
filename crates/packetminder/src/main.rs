@@ -126,6 +126,9 @@ fn run(cfg: Config) {
         for a in tracker.tick(&cfg) {
             alert::emit(&cfg, &a);
         }
+        // Only after the bare alerts are on screen: the enriched re-emit
+        // replaces them through the dedup key, and replacement is directional.
+        tracker.spawn_pending_enrichment(&cfg);
 
         // An interface-level alert is far more useful when it can name the
         // source, so hand it whatever the drop log currently knows.

@@ -629,26 +629,57 @@ pub fn is_private(ip: &str) -> bool {
         || (a == 100 && (64..128).contains(&b))
 }
 
+/// Run a command with a hard deadline, returning its stdout.
+///
+/// The child is killed and reaped on expiry — the old with_timeout wrapper
+/// merely stopped waiting, which left the child and its watcher thread alive
+/// for as long as the command cared to hang. On a host whose resolver stalls —
+/// the very condition this daemon investigates — every lookup leaked one.
+/// stdout is drained concurrently so output larger than the pipe buffer cannot
+/// block the child into a timeout.
+fn stdout_with_deadline(program: &str, args: &[&str], secs: u64) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let (tx, rx) = channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = tx.send(text);
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+    rx.recv_timeout(Duration::from_secs(1)).ok()
+}
+
 fn reverse_dns(ip: &str) -> Option<String> {
-    let query = ip.to_string();
-    with_timeout(2, move || {
-        let out = Command::new("getent")
-            .args(["hosts", &query])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        // Output is "<address> <canonical name> [aliases…]".
-        let text = String::from_utf8_lossy(&out.stdout);
-        let name = text.split_whitespace().nth(1)?;
-        if name.is_empty() || name == query {
-            None
-        } else {
-            Some(name.to_string())
-        }
-    })
-    .flatten()
+    let text = stdout_with_deadline("getent", &["hosts", ip], 2)?;
+    // Output is "<address> <canonical name> [aliases…]".
+    let name = text.split_whitespace().nth(1)?;
+    if name.is_empty() || name == ip {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn neighbour_mac(ip: &str) -> Option<String> {
@@ -689,41 +720,8 @@ fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
     org
 }
 
-/// whois with a hard deadline: killed and reaped on expiry, stdout drained
-/// concurrently so a chatty registry cannot block the child on a full pipe.
-/// Abandoning the wait, as the old with_timeout wrapper did, left a whois that
-/// never exits running forever.
 fn whois_org_uncached(ip: &str, timeout_secs: u64) -> Option<String> {
-    let mut child = Command::new("whois")
-        .arg(ip)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    let (tx, rx) = channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        thread::spawn(move || {
-            let mut text = String::new();
-            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
-            let _ = tx.send(text);
-        });
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(100)),
-            Err(_) => return None,
-        }
-    }
-    let text = rx.recv_timeout(Duration::from_secs(1)).ok()?;
+    let text = stdout_with_deadline("whois", &[ip], timeout_secs)?;
 
     for prefix in [
         "OrgName:",
@@ -742,21 +740,6 @@ fn whois_org_uncached(ip: &str, timeout_secs: u64) -> Option<String> {
         }
     }
     None
-}
-
-/// Run `f` on a helper thread, giving up after `secs`.
-///
-/// Every enrichment lookup shells out either to something that talks to the
-/// network (`whois`) or to a resolver that may itself be waiting on the network
-/// (`getent`). Neither may be allowed to stall the detector loop, and on this
-/// host the resolver stalling is exactly the condition being investigated.
-fn with_timeout<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let (tx, rx) = channel();
-    thread::spawn(move || {
-        // The receiver is gone on timeout; that is expected, not an error.
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(Duration::from_secs(secs)).ok()
 }
 
 // -- Local Socket Lookup ------------------------------------------------------
