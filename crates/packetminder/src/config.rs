@@ -374,6 +374,31 @@ fn set_usize(slot: &mut usize, value: &str) -> bool {
     }
 }
 
+/// A fraction: finite and inside [0, 1]. `asym_ratio = -1` parses fine as a
+/// float and then silently disables the detector it configures, which is the
+/// kind of typo that should be a warning, not a behaviour.
+fn set_ratio(slot: &mut f64, value: &str) -> bool {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
+            *slot = v;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A magnitude: finite and at least `min`. NaN fails every comparison it later
+/// feeds, which reads as "never alert" — refuse it here instead.
+fn set_f64_at_least(slot: &mut f64, value: &str, min: f64) -> bool {
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= min => {
+            *slot = v;
+            true
+        }
+        _ => false,
+    }
+}
+
 // -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
@@ -403,30 +428,5 @@ mod tests {
             assert!(!set_f64_at_least(&mut slot, bad, 0.0), "{bad} must be refused");
         }
         assert_eq!(slot, 1_000_000.0);
-    }
-}
-
-/// A fraction: finite and inside [0, 1]. `asym_ratio = -1` parses fine as a
-/// float and then silently disables the detector it configures, which is the
-/// kind of typo that should be a warning, not a behaviour.
-fn set_ratio(slot: &mut f64, value: &str) -> bool {
-    match value.parse::<f64>() {
-        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => {
-            *slot = v;
-            true
-        }
-        _ => false,
-    }
-}
-
-/// A magnitude: finite and at least `min`. NaN fails every comparison it later
-/// feeds, which reads as "never alert" — refuse it here instead.
-fn set_f64_at_least(slot: &mut f64, value: &str, min: f64) -> bool {
-    match value.parse::<f64>() {
-        Ok(v) if v.is_finite() && v >= min => {
-            *slot = v;
-            true
-        }
-        _ => false,
     }
 }

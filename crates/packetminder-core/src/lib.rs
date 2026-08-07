@@ -46,7 +46,10 @@ pub struct Conn {
 pub struct App {
     pub conns: HashMap<String, Conn>,
     pub isp_cache: Arc<Mutex<HashMap<String, String>>>,
-    pub pending_lookups: HashSet<String>,
+    /// Lookups currently in flight. Shared with the workers so each can clear
+    /// its own entry on completion — an entry that never cleared meant an IP
+    /// whose first lookup raced a disconnect could never be looked up again.
+    pub pending_lookups: Arc<Mutex<HashSet<String>>>,
     pub sort_col: usize,
 }
 
@@ -63,7 +66,7 @@ impl App {
         Self {
             conns: HashMap::new(),
             isp_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_lookups: HashSet::new(),
+            pending_lookups: Arc::new(Mutex::new(HashSet::new())),
             sort_col: DEFAULT_SORT_COL,
         }
     }
@@ -150,12 +153,16 @@ impl App {
 
         self.conns.retain(|k, _| seen.contains(k));
 
-        let cache = self.isp_cache.lock().unwrap();
-        for conn in self.conns.values_mut() {
-            if conn.isp == "..." {
-                let ip = conn.remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&conn.remote);
-                if let Some(isp) = cache.get(ip) {
-                    conn.isp = isp.clone();
+        // Not unwrap: a poisoned lock here (a panicked worker) would take the
+        // main loop down with it, and stale "..." cells are the better failure.
+        if let Ok(cache) = self.isp_cache.lock() {
+            for conn in self.conns.values_mut() {
+                if conn.isp == "..." {
+                    let ip =
+                        conn.remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&conn.remote);
+                    if let Some(isp) = cache.get(ip) {
+                        conn.isp = isp.clone();
+                    }
                 }
             }
         }
@@ -165,15 +172,27 @@ impl App {
     pub fn spawn_isp_lookup(&mut self, remote: &str) {
         let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote).to_string();
 
-        if self.pending_lookups.contains(&ip) {
+        if let Ok(mut pending) = self.pending_lookups.lock() {
+            if !pending.insert(ip.clone()) {
+                return; // already in flight
+            }
+        } else {
             return;
         }
-        self.pending_lookups.insert(ip.clone());
 
         let cache = Arc::clone(&self.isp_cache);
+        let pending = Arc::clone(&self.pending_lookups);
         thread::spawn(move || {
             let isp = run_whois(&ip);
-            cache.lock().unwrap().insert(ip, isp);
+            // Failures are cached as "?" too — retrying every poll would hammer
+            // whois servers whenever one is unreachable. The cache, not the
+            // pending set, is what prevents lookup storms.
+            if let Ok(mut cache) = cache.lock() {
+                cache.insert(ip.clone(), isp);
+            }
+            if let Ok(mut pending) = pending.lock() {
+                pending.remove(&ip);
+            }
         });
     }
 
@@ -196,8 +215,26 @@ impl App {
 
 // -- Whois Lookup -------------------------------------------------------------
 
-/// Run `whois <ip>` and extract the ISP/organization name from the output.
+/// How long a whois answer stays worth waiting for. whois servers hang for
+/// minutes when unreachable, and an unbounded wait pinned its worker thread
+/// for the duration.
+const WHOIS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `whois <ip>` with a timeout, extracting the ISP/organization name.
+///
+/// On timeout the answer is "?" and the inner thread is left to finish and be
+/// discarded — bounded by however long whois itself takes to give up, which is
+/// the same bargain the daemon's lookup timeouts strike.
 pub fn run_whois(ip: &str) -> String {
+    let query = ip.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(run_whois_blocking(&query));
+    });
+    rx.recv_timeout(WHOIS_TIMEOUT).unwrap_or_else(|_| "?".into())
+}
+
+fn run_whois_blocking(ip: &str) -> String {
     let output = Command::new("whois").arg(ip).output();
     let output = match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
