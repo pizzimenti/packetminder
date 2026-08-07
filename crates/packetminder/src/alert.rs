@@ -15,11 +15,12 @@ use std::{
     env,
     fmt::Write as _,
     fs,
+    io::Read as _,
     net::Ipv4Addr,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc::channel},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::config::Config;
@@ -43,7 +44,17 @@ pub struct Alert {
 
 // -- Emitting -----------------------------------------------------------------
 
-pub fn emit(cfg: &Config, alert: &Alert) {
+/// How long the notify thread babysits a popup's button before killing the
+/// waiter. KDE keeps critical-urgency notifications on screen until they are
+/// dismissed, so an unbounded wait held a thread and a notify-send process for
+/// as long as the popup sat there.
+const BUTTON_WAIT_SECS: u64 = 600;
+
+/// Returns the handle of the thread waiting on the popup, when one was
+/// spawned. The daemon ignores it — it never exits, so detached is fine.
+/// `--selftest` joins it, so it waits exactly as long as the popup lives
+/// instead of a guessed constant.
+pub fn emit(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     // The journal gets everything; the popup gets only `body`. Splitting them
     // is the whole point -- a notification that has to be scrolled has already
     // failed, but the context is still worth keeping somewhere.
@@ -59,9 +70,7 @@ pub fn emit(cfg: &Config, alert: &Alert) {
     }
     log(&line);
 
-    if cfg.notify {
-        notify(cfg, alert);
-    }
+    if cfg.notify { notify(cfg, alert) } else { None }
 }
 
 /// Write a timestamped line to stderr, which the user unit routes to the
@@ -73,7 +82,7 @@ pub fn log(message: &str) {
     eprintln!("{} {}", fmt_iso_local(now_epoch()), message);
 }
 
-fn notify(cfg: &Config, alert: &Alert) {
+fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     // The synchronous hint makes a repeat alert replace its predecessor rather
     // than stacking another popup on the pile.
     let hint = format!("string:x-canonical-private-synchronous:packetminder-{}", alert.key);
@@ -110,23 +119,44 @@ fn notify(cfg: &Config, alert: &Alert) {
         .stderr(Stdio::null())
         .spawn();
 
-    let child = match spawned {
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             eprintln!("packetminder: notify-send failed: {e}");
-            return;
+            return None;
         }
     };
 
-    thread::spawn(move || {
-        let Ok(out) = child.wait_with_output() else {
-            return;
-        };
+    Some(thread::spawn(move || {
+        // Poll rather than block: `--wait` lives as long as the popup, and a
+        // critical-urgency popup lives until somebody dismisses it. Past the
+        // deadline the waiter is killed — the button goes dead, the thread and
+        // process are reclaimed, and the alert itself was delivered long ago.
+        let deadline = Instant::now() + Duration::from_secs(BUTTON_WAIT_SECS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_secs(2)),
+                Err(_) => return,
+            }
+        }
+
         let Some(cmd) = launch else {
             return; // No button was offered; the wait was only to reap it.
         };
+        // notify-send writes at most one action name, far below the pipe
+        // buffer, so reading after exit cannot have blocked the child.
+        let mut pressed = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut pressed);
+        }
         // Anything else means the popup was dismissed rather than actioned.
-        if String::from_utf8_lossy(&out.stdout).trim() != "tui" {
+        if pressed.trim() != "tui" {
             return;
         }
         let Some((program, rest)) = cmd.split_first() else {
@@ -140,7 +170,7 @@ fn notify(cfg: &Config, alert: &Alert) {
         {
             eprintln!("packetminder: cannot launch {program}: {e}");
         }
-    });
+    }))
 }
 
 /// What the alert's button should run, or None to offer no button.

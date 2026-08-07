@@ -33,8 +33,12 @@ mod selfblock;
 mod sockets;
 
 use std::{
-    collections::HashSet, env, net::IpAddr, process::Command, thread,
-    time::Duration,
+    collections::HashSet,
+    env,
+    net::IpAddr,
+    process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -379,15 +383,27 @@ fn selftest(cfg: Config) {
         detail: "Emitted by --selftest, not by a detector.".to_string(),
         urgency: "normal",
     };
-    alert::emit(&cfg, &a);
+    let waiter = alert::emit(&cfg, &a);
     println!("Emitted a test alert. See: journalctl --user -u packetminder");
 
     // The button's click handler runs in a thread this process owns. Exiting
     // now would leave a popup whose button does nothing — worse than offering
-    // no button at all. The daemon has no such problem because it never exits,
-    // so this wait exists purely to make --selftest exercise the real path.
-    if cfg.notify {
-        println!("Waiting 45s so the \"Open packetminder\" button works — Ctrl-C to skip.");
-        thread::sleep(Duration::from_secs(45));
+    // no button at all. The daemon has no such problem because it never exits.
+    //
+    // Joining outright is not the answer either: KDE keeps an actioned
+    // notification alive in its tray past the visible popup, so notify-send's
+    // --wait can outlive the on-screen part by minutes. Return the moment the
+    // popup is actioned or closed, and give up after a minute otherwise.
+    if let Some(handle) = waiter {
+        println!("Waiting up to 60s for the notification — click or dismiss it, or Ctrl-C.");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(250));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        } else {
+            println!("Notification still pending; exiting — its button dies with this process.");
+        }
     }
 }
