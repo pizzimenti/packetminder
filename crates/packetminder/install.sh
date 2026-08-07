@@ -102,6 +102,9 @@ if [[ ! -f "$config_dir/packetminder.conf" ]]; then
 # travel routers are both "GL", and mDNS gives whatever the firmware publishes,
 # which is often a serial number.
 #
+# One caveat: everything after a # is a comment, including inside a value, so
+# a device name cannot contain one.
+#
 # name a8:b5:7c:53:b2:fe = Roku
 # name 10.3.59.7         = caldera
 

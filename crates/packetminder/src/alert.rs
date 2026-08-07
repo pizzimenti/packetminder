@@ -15,17 +15,19 @@ use std::{
     env,
     fmt::Write as _,
     fs,
+    io::Read as _,
     net::Ipv4Addr,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc::channel},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::config::Config;
 
 // -- Data Structures ----------------------------------------------------------
 
+#[derive(Clone)]
 pub struct Alert {
     /// Machine-readable category, e.g. "asymmetric-inbound".
     pub kind: &'static str,
@@ -43,7 +45,17 @@ pub struct Alert {
 
 // -- Emitting -----------------------------------------------------------------
 
-pub fn emit(cfg: &Config, alert: &Alert) {
+/// How long the notify thread babysits a popup's button before killing the
+/// waiter. KDE keeps critical-urgency notifications on screen until they are
+/// dismissed, so an unbounded wait held a thread and a notify-send process for
+/// as long as the popup sat there.
+const BUTTON_WAIT_SECS: u64 = 600;
+
+/// Returns the handle of the thread waiting on the popup, when one was
+/// spawned. The daemon ignores it — it never exits, so detached is fine.
+/// `--selftest` joins it, so it waits exactly as long as the popup lives
+/// instead of a guessed constant.
+pub fn emit(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     // The journal gets everything; the popup gets only `body`. Splitting them
     // is the whole point -- a notification that has to be scrolled has already
     // failed, but the context is still worth keeping somewhere.
@@ -59,9 +71,7 @@ pub fn emit(cfg: &Config, alert: &Alert) {
     }
     log(&line);
 
-    if cfg.notify {
-        notify(cfg, alert);
-    }
+    if cfg.notify { notify(cfg, alert) } else { None }
 }
 
 /// Write a timestamped line to stderr, which the user unit routes to the
@@ -73,7 +83,7 @@ pub fn log(message: &str) {
     eprintln!("{} {}", fmt_iso_local(now_epoch()), message);
 }
 
-fn notify(cfg: &Config, alert: &Alert) {
+fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     // The synchronous hint makes a repeat alert replace its predecessor rather
     // than stacking another popup on the pile.
     let hint = format!("string:x-canonical-private-synchronous:packetminder-{}", alert.key);
@@ -110,23 +120,44 @@ fn notify(cfg: &Config, alert: &Alert) {
         .stderr(Stdio::null())
         .spawn();
 
-    let child = match spawned {
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             eprintln!("packetminder: notify-send failed: {e}");
-            return;
+            return None;
         }
     };
 
-    thread::spawn(move || {
-        let Ok(out) = child.wait_with_output() else {
-            return;
-        };
+    Some(thread::spawn(move || {
+        // Poll rather than block: `--wait` lives as long as the popup, and a
+        // critical-urgency popup lives until somebody dismisses it. Past the
+        // deadline the waiter is killed — the button goes dead, the thread and
+        // process are reclaimed, and the alert itself was delivered long ago.
+        let deadline = Instant::now() + Duration::from_secs(BUTTON_WAIT_SECS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_secs(2)),
+                Err(_) => return,
+            }
+        }
+
         let Some(cmd) = launch else {
             return; // No button was offered; the wait was only to reap it.
         };
+        // notify-send writes at most one action name, far below the pipe
+        // buffer, so reading after exit cannot have blocked the child.
+        let mut pressed = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut pressed);
+        }
         // Anything else means the popup was dismissed rather than actioned.
-        if String::from_utf8_lossy(&out.stdout).trim() != "tui" {
+        if pressed.trim() != "tui" {
             return;
         }
         let Some((program, rest)) = cmd.split_first() else {
@@ -140,7 +171,7 @@ fn notify(cfg: &Config, alert: &Alert) {
         {
             eprintln!("packetminder: cannot launch {program}: {e}");
         }
-    });
+    }))
 }
 
 /// What the alert's button should run, or None to offer no button.
@@ -210,6 +241,20 @@ fn vendor_cache() -> &'static VendorCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How long a whois answer is reused. Allocation ownership does not move on
+/// DHCP timescales, so this is generous — and it is what lets the cached
+/// describe_source include the ISP, which in turn is what makes an enrichment
+/// rebuild identical to the immediate alert for a repeat offender.
+const WHOIS_TTL_SECS: i64 = 3600;
+
+/// ip → (org, when). Negatives cached too, same argument as the name cache.
+type WhoisCache = Mutex<HashMap<String, (Option<String>, i64)>>;
+
+fn whois_cache() -> &'static WhoisCache {
+    static CACHE: OnceLock<WhoisCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Names from the config, keyed by lowercase MAC or by address.
 static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
@@ -249,13 +294,17 @@ fn chosen_name(ip: &str) -> Option<String> {
 /// The address is always kept alongside the name. A name alone is ambiguous
 /// after a DHCP reshuffle, and the address is what you need to write a firewall
 /// rule or start a capture.
-pub fn device_label(ip: &str) -> String {
+///
+/// Cache-only: consults the name cache but never shells out to a resolver, so
+/// it is safe on the detector loop. The enrichment threads are what fill the
+/// cache; until one has, a source shows as its vendor or bare address.
+pub fn device_label_cached(ip: &str) -> String {
     // A name you chose beats anything that can be discovered, always.
     if let Some(name) = chosen_name(ip) {
         return format!("{name} ({ip})");
     }
 
-    let named = hostname_for(ip);
+    let named = hostname_cached(ip);
     let short = named
         .as_deref()
         .and_then(|n| n.split('.').next())
@@ -287,12 +336,30 @@ pub fn device_label(ip: &str) -> String {
 /// the vendor behind the MAC — which is what tells you what the thing actually
 /// is. Collapsing them into one label, as this used to, always threw away
 /// whichever half the reader happened to need.
+///
+/// This variant resolves: it may wait on `getent` (2s cap). Keep it off the
+/// detector loop — that is what `identity_cached` is for.
 pub fn identity(ip: &str) -> (String, Option<String>) {
-    let hostname = hostname_for(ip)
+    identity_at(ip, true)
+}
+
+/// `identity`, but consulting caches only — never a resolver. Safe anywhere.
+pub fn identity_cached(ip: &str) -> (String, Option<String>) {
+    identity_at(ip, false)
+}
+
+fn identity_at(ip: &str, resolve: bool) -> (String, Option<String>) {
+    let fqdn = if resolve {
+        hostname_for(ip)
+    } else {
+        hostname_cached(ip)
+    };
+    let hostname = fqdn
+        .as_deref()
         .and_then(|n| n.split('.').next().map(str::to_string))
         .filter(|n| !n.is_empty());
 
-    let primary = match hostname_for(ip) {
+    let primary = match &fqdn {
         Some(fqdn) => format!("{fqdn} ({ip})"),
         None => ip.to_string(),
     };
@@ -491,6 +558,19 @@ pub fn hostname_for(ip: &str) -> Option<String> {
     name
 }
 
+/// The cached hostname, or None — never a lookup. A miss here is not "no
+/// name"; it is "not resolved yet", which the enrichment path fixes moments
+/// later.
+fn hostname_cached(ip: &str) -> Option<String> {
+    let cache = name_cache().lock().ok()?;
+    let (name, at) = cache.get(ip)?;
+    if now_epoch() - at < NAME_TTL_SECS {
+        name.clone()
+    } else {
+        None
+    }
+}
+
 /// Context for a source address beyond its name: which network it sits on, and
 /// who operates it. The name itself is already in the alert title.
 ///
@@ -499,6 +579,17 @@ pub fn hostname_for(ip: &str) -> Option<String> {
 /// misleading answer — it names whoever owns the allocation, so a machine on
 /// the same switch gets reported as an ISP on the far side of the internet.
 pub fn describe_source(ip: &str, nearby: bool) -> String {
+    describe_source_at(ip, nearby, true)
+}
+
+/// `describe_source` without the whois: an internet source is just "internet"
+/// until an enrichment thread has asked. The LAN path is unchanged — the
+/// neighbour table is a local netlink dump, not a network wait.
+pub fn describe_source_cached(ip: &str, nearby: bool) -> String {
+    describe_source_at(ip, nearby, false)
+}
+
+fn describe_source_at(ip: &str, nearby: bool, resolve: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
 
     if nearby {
@@ -510,7 +601,12 @@ pub fn describe_source(ip: &str, nearby: bool) -> String {
         }
     } else {
         parts.push("internet".to_string());
-        if let Some(isp) = whois_org(ip, 5) {
+        let isp = if resolve {
+            whois_org(ip, 5)
+        } else {
+            whois_org_cached(ip)
+        };
+        if let Some(isp) = isp {
             parts.push(isp);
         }
     }
@@ -533,26 +629,57 @@ pub fn is_private(ip: &str) -> bool {
         || (a == 100 && (64..128).contains(&b))
 }
 
+/// Run a command with a hard deadline, returning its stdout.
+///
+/// The child is killed and reaped on expiry — the old with_timeout wrapper
+/// merely stopped waiting, which left the child and its watcher thread alive
+/// for as long as the command cared to hang. On a host whose resolver stalls —
+/// the very condition this daemon investigates — every lookup leaked one.
+/// stdout is drained concurrently so output larger than the pipe buffer cannot
+/// block the child into a timeout.
+fn stdout_with_deadline(program: &str, args: &[&str], secs: u64) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let (tx, rx) = channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = tx.send(text);
+        });
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+    rx.recv_timeout(Duration::from_secs(1)).ok()
+}
+
 fn reverse_dns(ip: &str) -> Option<String> {
-    let query = ip.to_string();
-    with_timeout(2, move || {
-        let out = Command::new("getent")
-            .args(["hosts", &query])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        // Output is "<address> <canonical name> [aliases…]".
-        let text = String::from_utf8_lossy(&out.stdout);
-        let name = text.split_whitespace().nth(1)?;
-        if name.is_empty() || name == query {
-            None
-        } else {
-            Some(name.to_string())
-        }
-    })
-    .flatten()
+    let text = stdout_with_deadline("getent", &["hosts", ip], 2)?;
+    // Output is "<address> <canonical name> [aliases…]".
+    let name = text.split_whitespace().nth(1)?;
+    if name.is_empty() || name == ip {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn neighbour_mac(ip: &str) -> Option<String> {
@@ -567,49 +694,52 @@ fn neighbour_mac(ip: &str) -> Option<String> {
     None
 }
 
-fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
-    let query = ip.to_string();
-    with_timeout(timeout_secs, move || {
-        let text = Command::new("whois")
-            .arg(&query)
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())?;
+/// The cached whois answer, or None — never a lookup.
+fn whois_org_cached(ip: &str) -> Option<String> {
+    let cache = whois_cache().lock().ok()?;
+    let (org, at) = cache.get(ip)?;
+    if now_epoch() - at < WHOIS_TTL_SECS {
+        org.clone()
+    } else {
+        None
+    }
+}
 
-        for prefix in [
-            "OrgName:",
-            "org-name:",
-            "netname:",
-            "descr:",
-            "Organization:",
-        ] {
-            for line in text.lines() {
-                if let Some(rest) = line.trim().strip_prefix(prefix) {
-                    let name = rest.trim();
-                    if !name.is_empty() {
-                        return Some(name.to_string());
-                    }
+fn whois_org(ip: &str, timeout_secs: u64) -> Option<String> {
+    if let Ok(cache) = whois_cache().lock()
+        && let Some((org, at)) = cache.get(ip)
+        && now_epoch() - at < WHOIS_TTL_SECS
+    {
+        return org.clone();
+    }
+
+    let org = whois_org_uncached(ip, timeout_secs);
+    if let Ok(mut cache) = whois_cache().lock() {
+        cache.insert(ip.to_string(), (org.clone(), now_epoch()));
+    }
+    org
+}
+
+fn whois_org_uncached(ip: &str, timeout_secs: u64) -> Option<String> {
+    let text = stdout_with_deadline("whois", &[ip], timeout_secs)?;
+
+    for prefix in [
+        "OrgName:",
+        "org-name:",
+        "netname:",
+        "descr:",
+        "Organization:",
+    ] {
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix(prefix) {
+                let name = rest.trim();
+                if !name.is_empty() {
+                    return Some(name.to_string());
                 }
             }
         }
-        None
-    })
-    .flatten()
-}
-
-/// Run `f` on a helper thread, giving up after `secs`.
-///
-/// Every enrichment lookup shells out either to something that talks to the
-/// network (`whois`) or to a resolver that may itself be waiting on the network
-/// (`getent`). Neither may be allowed to stall the detector loop, and on this
-/// host the resolver stalling is exactly the condition being investigated.
-fn with_timeout<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-    let (tx, rx) = channel();
-    thread::spawn(move || {
-        // The receiver is gone on timeout; that is expected, not an error.
-        let _ = tx.send(f());
-    });
-    rx.recv_timeout(Duration::from_secs(secs)).ok()
+    }
+    None
 }
 
 // -- Local Socket Lookup ------------------------------------------------------

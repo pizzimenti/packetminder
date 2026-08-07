@@ -21,15 +21,18 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader},
     process::{Command, Stdio},
-    sync::mpsc::{Receiver, channel},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{Receiver, channel},
+    },
     thread,
     time::Duration,
 };
 
 use crate::{
     alert::{
-        self, Alert, describe_source, device_label, fmt_bytes, fmt_duration, identity, is_private,
-        now_epoch, port_in_use,
+        self, Alert, describe_source, describe_source_cached, device_label_cached, fmt_bytes,
+        fmt_duration, identity, identity_cached, is_private, now_epoch, port_in_use,
     },
     config::Config,
     local::{LocalNet, parse_ip},
@@ -110,6 +113,33 @@ pub struct FlowTracker {
     /// Records this detector rejects are not thrown away — traffic this host
     /// sends and then drops is a different problem, judged on its own terms.
     selfblock: SelfBlockTracker,
+    /// Resolve names while building alerts, instead of emitting immediately
+    /// and enriching in the background. Only `--replay` wants this: it is
+    /// offline, blocking is free there, and it must never spawn threads that
+    /// would raise real notifications about historical traffic.
+    resolve_inline: bool,
+    /// Enrichment waiting for its bare alert to be emitted first. Spawning at
+    /// alert-build time raced the emit: a fast resolution could land the
+    /// enriched popup first, only for the bare one to replace it through the
+    /// same dedup key. The caller drains this *after* emitting.
+    pending_enrich: Vec<(FlowFacts, Alert)>,
+}
+
+/// Everything an alert says about a flow, copied out of the tracker so a
+/// background thread can rebuild the alert once names have resolved — the
+/// tracker itself cannot cross a thread boundary, and should not.
+#[derive(Clone)]
+struct FlowFacts {
+    src: String,
+    proto_lower: String,
+    dport: u16,
+    sport: u16,
+    total: u64,
+    bytes: u64,
+    iface: String,
+    duration: String,
+    listening: bool,
+    nearby: bool,
 }
 
 // -- Journal Follower ---------------------------------------------------------
@@ -208,6 +238,26 @@ impl FlowTracker {
             local,
             skipped: SkipCounts::default(),
             selfblock: SelfBlockTracker::new(),
+            resolve_inline: false,
+            pending_enrich: Vec::new(),
+        }
+    }
+
+    /// Resolve names while building alerts rather than in the background.
+    /// `--replay` only: blocking is free offline, and replay must never spawn
+    /// enrichment threads that raise real popups about historical traffic.
+    pub fn resolve_names_inline(&mut self) {
+        self.resolve_inline = true;
+    }
+
+    /// Start background enrichment for alerts the caller has now emitted.
+    ///
+    /// Separate from tick() on purpose: the enriched re-emit replaces the bare
+    /// popup through the dedup key, and replacement only works if the bare one
+    /// is on screen first. Spawning inside tick() raced that ordering.
+    pub fn spawn_pending_enrichment(&mut self, cfg: &Config) {
+        for (facts, bare) in self.pending_enrich.drain(..) {
+            spawn_enrichment(cfg.clone(), facts, bare);
         }
     }
 
@@ -318,7 +368,7 @@ impl FlowTracker {
                         alert::log(
                             &format!(
                                 "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
-                                device_label(&key.src),
+                                device_label_cached(&key.src),
                                 key.proto.to_lowercase(),
                                 key.dport,
                                 fmt_duration((state.last - state.first).max(0) as u64),
@@ -346,7 +396,19 @@ impl FlowTracker {
             }
 
             state.alerted_at = Some(now);
-            alerts.push(build_alert(key, state, now, &self.local));
+
+            let facts = gather_facts(key, state, now, &self.local);
+            if self.resolve_inline {
+                alerts.push(compose_alert(&facts, true));
+            } else {
+                // Emit with whatever the caches hold right now — the loop must
+                // not wait on getent or whois. Enrichment is queued, not
+                // spawned: it starts only once the caller has actually emitted
+                // this alert, via spawn_pending_enrichment.
+                let bare = compose_alert(&facts, false);
+                self.pending_enrich.push((facts, bare.clone()));
+                alerts.push(bare);
+            }
         }
 
         for key in finished {
@@ -376,7 +438,7 @@ impl FlowTracker {
             .map(|(k, s)| {
                 format!(
                     "{} → {}/{} ({} drops)",
-                    device_label(&k.src),
+                    device_label_cached(&k.src),
                     k.proto.to_lowercase(),
                     k.dport,
                     s.times.len()
@@ -388,22 +450,41 @@ impl FlowTracker {
     }
 }
 
-fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> Alert {
-    let proto = key.proto.to_lowercase();
-    let duration = fmt_duration((now - state.first).max(0) as u64);
-    let listening = port_in_use(&key.proto, key.dport);
+fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> FlowFacts {
+    FlowFacts {
+        src: key.src.clone(),
+        proto_lower: key.proto.to_lowercase(),
+        dport: key.dport,
+        sport: state.sport,
+        total: state.total,
+        bytes: state.bytes,
+        iface: state.iface.clone(),
+        duration: fmt_duration((now - state.first).max(0) as u64),
+        listening: port_in_use(&key.proto, key.dport),
+        // "Not the internet" is two conditions, and both are needed. On a
+        // subnet this host is attached to is the only one that means anything
+        // under IPv6. Private v4 space is the fallback: it still holds when
+        // address discovery has failed, and it covers a LAN host reached
+        // through a router.
+        nearby: parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip))
+            || is_private(&key.src),
+    }
+}
 
-    // "Not the internet" is two conditions, and both are needed. On a subnet
-    // this host is attached to is the only one that means anything under IPv6.
-    // Private v4 space is the fallback: it still holds when address discovery
-    // has failed, and it covers a LAN host reached through a router.
-    let nearby =
-        parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(&key.src);
+/// Build the alert from gathered facts. With `resolve` the lookups may wait on
+/// the network; without it only caches are consulted, so it is safe on the
+/// detector loop.
+fn compose_alert(facts: &FlowFacts, resolve: bool) -> Alert {
+    let proto = &facts.proto_lower;
 
     // Line one is what we worked out the device is; line two is what it did.
     // The raw hostname and address live in the title, because that is the half
     // you act on.
-    let (who, derived) = identity(&key.src);
+    let (who, derived) = if resolve {
+        identity(&facts.src)
+    } else {
+        identity_cached(&facts.src)
+    };
 
     let mut body = String::new();
     if let Some(d) = &derived {
@@ -412,10 +493,10 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     }
     body.push_str(&format!(
         "{} drops over {} on {}, still going. {}",
-        state.total,
-        duration,
-        state.iface,
-        if listening {
+        facts.total,
+        facts.duration,
+        facts.iface,
+        if facts.listening {
             "Something IS listening — the firewall is blocking it."
         } else {
             "Nothing is listening."
@@ -427,14 +508,19 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     let mut detail = format!(
         "{} logged. ufw rate-limits its own logging, so the count measures \
          persistence, not volume.",
-        fmt_bytes(state.bytes),
+        fmt_bytes(facts.bytes),
     );
-    if !listening {
+    if !facts.listening {
         detail.push_str(" The sender is getting no feedback because the drop is silent.");
     }
-    detail.push_str(&format!(" Source: {}", describe_source(&key.src, nearby)));
-    if state.sport != 0 {
-        detail.push_str(&format!(" from {proto}/{}", state.sport));
+    let source = if resolve {
+        describe_source(&facts.src, facts.nearby)
+    } else {
+        describe_source_cached(&facts.src, facts.nearby)
+    };
+    detail.push_str(&format!(" Source: {source}"));
+    if facts.sport != 0 {
+        detail.push_str(&format!(" from {proto}/{}", facts.sport));
     }
 
     // Volume cannot be read off a rate-limited log, so urgency comes from what
@@ -442,18 +528,61 @@ fn build_alert(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> 
     // transmitting into a black hole are both somebody's mistake worth waking
     // up for. The internet knocking on a closed port all day is just the
     // internet, and does not get to interrupt anyone.
-    let urgency = if listening || nearby { "critical" } else { "normal" };
+    let urgency = if facts.listening || facts.nearby { "critical" } else { "normal" };
 
     Alert {
         kind: "blocked-flow",
         // Keyed on the address and never the resolved name, so that the popup
         // still replaces its predecessor when a name starts or stops resolving.
-        key: format!("flow-{}-{}-{}", key.src, proto, key.dport),
-        title: format!("{who} — blocked {proto}/{}", key.dport),
+        key: format!("flow-{}-{}-{}", facts.src, proto, facts.dport),
+        title: format!("{who} — blocked {proto}/{}", facts.dport),
         body,
         detail,
         urgency,
     }
+}
+
+/// Enrichment threads in flight, and the most that may be. A port sweep can
+/// push many distinct flows over the alert threshold in one tick; each would
+/// otherwise spawn a thread that waits on getent and whois.
+static ENRICHERS: AtomicUsize = AtomicUsize::new(0);
+const MAX_ENRICHERS: usize = 8;
+
+/// Frees the slot however the thread ends — a panicking lookup must not leak
+/// capacity until nothing can ever enrich again.
+struct EnricherSlot;
+
+impl Drop for EnricherSlot {
+    fn drop(&mut self) {
+        ENRICHERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Resolve names off the loop, then re-emit if resolution changed anything.
+///
+/// The re-emit reuses the alert's dedup key, so the popup on screen updates in
+/// place rather than stacking; the journal gets a second, richer line. When
+/// the caches already held everything — the common case for a repeat offender
+/// — the rebuilt alert is identical and nothing is emitted at all.
+///
+/// Bounded: past MAX_ENRICHERS concurrent workers the enrichment is skipped,
+/// not queued. The immediate alert was already complete when it was emitted;
+/// enrichment is a refinement, and refinements do not get to exhaust threads.
+fn spawn_enrichment(cfg: Config, facts: FlowFacts, bare: Alert) {
+    if ENRICHERS.fetch_add(1, Ordering::SeqCst) >= MAX_ENRICHERS {
+        ENRICHERS.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    thread::spawn(move || {
+        let _slot = EnricherSlot;
+        let enriched = compose_alert(&facts, true);
+        if enriched.title != bare.title
+            || enriched.body != bare.body
+            || enriched.detail != bare.detail
+        {
+            let _ = alert::emit(&cfg, &enriched);
+        }
+    });
 }
 
 // -- Timestamp Parsing --------------------------------------------------------
@@ -529,8 +658,15 @@ mod tests {
 
     /// A tracker that believes it owns this machine's addresses, so tests never
     /// depend on whatever the host running them actually has configured.
+    ///
+    /// Inline resolution, for the same reason --replay uses it: the background
+    /// path spawns threads that end in notify-send, and a test suite that
+    /// raises desktop popups has failed at being a test suite.
     fn tracker() -> FlowTracker {
-        FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246/16"], &["10.3.255.255"]))
+        let mut t =
+            FlowTracker::with_local(LocalNet::from_parts(&["10.3.153.246/16"], &["10.3.255.255"]));
+        t.resolve_names_inline();
+        t
     }
 
     #[test]

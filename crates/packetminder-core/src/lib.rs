@@ -7,10 +7,11 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    process::Command,
+    io::Read as _,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 // -- Constants ----------------------------------------------------------------
@@ -46,7 +47,10 @@ pub struct Conn {
 pub struct App {
     pub conns: HashMap<String, Conn>,
     pub isp_cache: Arc<Mutex<HashMap<String, String>>>,
-    pub pending_lookups: HashSet<String>,
+    /// Lookups currently in flight. Shared with the workers so each can clear
+    /// its own entry on completion — an entry that never cleared meant an IP
+    /// whose first lookup raced a disconnect could never be looked up again.
+    pub pending_lookups: Arc<Mutex<HashSet<String>>>,
     pub sort_col: usize,
 }
 
@@ -63,7 +67,7 @@ impl App {
         Self {
             conns: HashMap::new(),
             isp_cache: Arc::new(Mutex::new(HashMap::new())),
-            pending_lookups: HashSet::new(),
+            pending_lookups: Arc::new(Mutex::new(HashSet::new())),
             sort_col: DEFAULT_SORT_COL,
         }
     }
@@ -150,12 +154,16 @@ impl App {
 
         self.conns.retain(|k, _| seen.contains(k));
 
-        let cache = self.isp_cache.lock().unwrap();
-        for conn in self.conns.values_mut() {
-            if conn.isp == "..." {
-                let ip = conn.remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&conn.remote);
-                if let Some(isp) = cache.get(ip) {
-                    conn.isp = isp.clone();
+        // Not unwrap: a poisoned lock here (a panicked worker) would take the
+        // main loop down with it, and stale "..." cells are the better failure.
+        if let Ok(cache) = self.isp_cache.lock() {
+            for conn in self.conns.values_mut() {
+                if conn.isp == "..." {
+                    let ip =
+                        conn.remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&conn.remote);
+                    if let Some(isp) = cache.get(ip) {
+                        conn.isp = isp.clone();
+                    }
                 }
             }
         }
@@ -165,15 +173,34 @@ impl App {
     pub fn spawn_isp_lookup(&mut self, remote: &str) {
         let ip = remote.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(remote).to_string();
 
-        if self.pending_lookups.contains(&ip) {
+        // The cache is checked before anything is spawned. Short-lived
+        // connections to one host reappear constantly, and without this every
+        // reappearance re-ran whois for an answer already in hand — failures
+        // included, since "?" is cached too.
+        if let Ok(cache) = self.isp_cache.lock()
+            && cache.contains_key(&ip)
+        {
             return;
         }
-        self.pending_lookups.insert(ip.clone());
+
+        if let Ok(mut pending) = self.pending_lookups.lock() {
+            if !pending.insert(ip.clone()) {
+                return; // already in flight
+            }
+        } else {
+            return;
+        }
 
         let cache = Arc::clone(&self.isp_cache);
+        let pending = Arc::clone(&self.pending_lookups);
         thread::spawn(move || {
             let isp = run_whois(&ip);
-            cache.lock().unwrap().insert(ip, isp);
+            if let Ok(mut cache) = cache.lock() {
+                cache.insert(ip.clone(), isp);
+            }
+            if let Ok(mut pending) = pending.lock() {
+                pending.remove(&ip);
+            }
         });
     }
 
@@ -196,14 +223,59 @@ impl App {
 
 // -- Whois Lookup -------------------------------------------------------------
 
-/// Run `whois <ip>` and extract the ISP/organization name from the output.
+/// How long a whois answer stays worth waiting for. whois servers hang for
+/// minutes when unreachable, and an unbounded wait pinned its worker thread
+/// for the duration.
+const WHOIS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `whois <ip>` with a hard deadline, extracting the ISP/organization
+/// name. "?" on any failure, timeout included.
+///
+/// The child is killed and reaped at the deadline — merely abandoning the wait
+/// leaves a whois that never exits running forever, and a retried IP could
+/// stack another one behind it. A separate thread drains stdout continuously,
+/// so a chatty registry cannot fill the pipe, block the child, and turn a slow
+/// answer into a timeout.
 pub fn run_whois(ip: &str) -> String {
-    let output = Command::new("whois").arg(ip).output();
-    let output = match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
-        Err(_) => return "?".into(),
+    let Ok(mut child) = Command::new("whois")
+        .arg(ip)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return "?".into();
     };
 
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+    }
+
+    let deadline = Instant::now() + WHOIS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "?".into();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(_) => return "?".into(),
+        }
+    }
+
+    let Ok(output) = rx.recv_timeout(Duration::from_secs(1)) else {
+        return "?".into();
+    };
+    parse_whois_org(&output)
+}
+
+fn parse_whois_org(output: &str) -> String {
     for prefix in ["OrgName:", "org-name:", "netname:", "descr:", "Organization:"] {
         for line in output.lines() {
             let trimmed = line.trim();
