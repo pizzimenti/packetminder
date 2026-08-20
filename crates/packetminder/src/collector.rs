@@ -30,6 +30,10 @@ pub struct Snapshot {
     /// Unix seconds the snapshot was written. Two samples with the same `at`
     /// are the same sample read twice, not a zero-length interval.
     pub at: i64,
+    /// Whether net.netfilter.nf_conntrack_acct was on when the sample was
+    /// taken. With it off the kernel emits no byte counters at all, so the
+    /// totals below are not small -- they are absent.
+    pub conntrack_acct: bool,
     pub conntrack_flows: u64,
     /// Monotonic. The collector accumulates per-flow increments precisely so
     /// this can be subtracted across expiries; see its comments for why summing
@@ -46,7 +50,25 @@ impl Snapshot {
     /// every 5s and callers tick faster than that, so reading the same file
     /// twice is the common case, and inventing a zero rate from it would look
     /// exactly like "nothing is consuming this".
+    /// Whether conntrack was in a position to measure anything at all.
+    ///
+    /// Blind, not quiet. Byte accounting off means every bytes= field is
+    /// missing, and a zero built from missing fields would be reported as
+    /// "conntrack watched and saw nothing consuming this" -- the exact sentence
+    /// that turns a healthy UDP stream into a critical alert.
+    ///
+    /// Zero tracked flows says the same thing without needing the newer
+    /// collector's acct field: conntrack contributed no information, so it
+    /// cannot be cited as evidence of absence. A host receiving enough to reach
+    /// the alert floor always has flows to show.
+    pub fn measures_bytes(&self) -> bool {
+        self.conntrack_acct && self.conntrack_flows > 0
+    }
+
     pub fn reply_bps_since(&self, prev: &Snapshot) -> Option<f64> {
+        if !self.measures_bytes() {
+            return None;
+        }
         let elapsed = self.at.checked_sub(prev.at)?;
         if elapsed <= 0 {
             return None;
@@ -78,6 +100,10 @@ pub fn read() -> Option<Snapshot> {
 
 fn parse(text: &str) -> Option<Snapshot> {
     let mut at = None;
+    // Absent means a collector older than the field. Assume accounting is on
+    // and let the flows == 0 check carry the blind case, rather than silently
+    // dropping corroboration on installs that were working fine.
+    let mut acct = true;
     let mut flows = 0;
     let mut reply = 0;
     let mut drop_pkts = 0;
@@ -92,6 +118,7 @@ fn parse(text: &str) -> Option<Snapshot> {
         };
         match key.trim() {
             "at" => at = Some(n as i64),
+            "conntrack_acct" => acct = n != 0,
             "conntrack_flows" => flows = n,
             "conntrack_reply_bytes" => reply = n,
             "input_drop_packets" => drop_pkts = n,
@@ -104,6 +131,7 @@ fn parse(text: &str) -> Option<Snapshot> {
     // snapshot missing it is not a partial snapshot -- it is unusable.
     Some(Snapshot {
         at: at?,
+        conntrack_acct: acct,
         conntrack_flows: flows,
         conntrack_reply_bytes: reply,
         input_drop_packets: drop_pkts,
@@ -117,7 +145,8 @@ fn parse(text: &str) -> Option<Snapshot> {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "at=1785890716\nconntrack_flows=68\nconntrack_reply_bytes=6077902\n\
+    const SAMPLE: &str = "at=1785890716\nconntrack_acct=1\nconntrack_flows=68\n\
+                          conntrack_reply_bytes=6077902\n\
                           input_drop_packets=1884\ninput_drop_bytes=659578\n";
 
     #[test]
@@ -126,6 +155,40 @@ mod tests {
         assert_eq!(s.at, 1785890716);
         assert_eq!(s.conntrack_reply_bytes, 6077902);
         assert_eq!(s.input_drop_packets, 1884);
+    }
+
+    /// The Moonlight false positive: a UDP stream that *was* being consumed,
+    /// reported as unread because accounting was off and the resulting zero was
+    /// mistaken for a measurement. Unmeasured must stay unmeasured.
+    #[test]
+    fn accounting_disabled_reads_as_unmeasured_not_as_zero() {
+        let prev = parse("at=100\nconntrack_acct=0\nconntrack_flows=0\nconntrack_reply_bytes=0\n")
+            .expect("should parse");
+        let now = parse("at=110\nconntrack_acct=0\nconntrack_flows=0\nconntrack_reply_bytes=0\n")
+            .expect("should parse");
+        assert!(!now.conntrack_acct);
+        assert_eq!(now.reply_bps_since(&prev), None);
+    }
+
+    /// An older collector predates the acct field, so zero flows has to carry
+    /// the same meaning on its own.
+    #[test]
+    fn zero_flows_is_unmeasured_even_without_the_acct_field() {
+        let prev = parse("at=100\nconntrack_flows=0\nconntrack_reply_bytes=0\n").expect("parses");
+        let now = parse("at=110\nconntrack_flows=0\nconntrack_reply_bytes=0\n").expect("parses");
+        assert!(now.conntrack_acct, "absent field assumes accounting is on");
+        assert_eq!(now.reply_bps_since(&prev), None);
+    }
+
+    /// A real measured zero -- flows tracked, accounting on, nothing consumed --
+    /// must still be reported, or a genuine flood loses its corroboration.
+    #[test]
+    fn a_measured_zero_is_still_a_measurement() {
+        let prev = parse("at=100\nconntrack_acct=1\nconntrack_flows=12\nconntrack_reply_bytes=500\n")
+            .expect("parses");
+        let now = parse("at=110\nconntrack_acct=1\nconntrack_flows=12\nconntrack_reply_bytes=500\n")
+            .expect("parses");
+        assert_eq!(now.reply_bps_since(&prev), Some(0.0));
     }
 
     #[test]

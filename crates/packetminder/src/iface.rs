@@ -55,6 +55,11 @@ pub struct AsymDetector {
     last_snapshot: Option<Snapshot>,
     /// Inbound bits/sec conntrack attributed over the last refresh interval.
     conntrack_rx_bps: Option<f64>,
+    /// The collector is installed but conntrack cannot measure bytes, so its
+    /// silence proves nothing about UDP.
+    conntrack_blind: bool,
+    /// Log the blindness once per onset, not every tick.
+    warned_blind: bool,
 }
 
 // -- Sampling -----------------------------------------------------------------
@@ -95,6 +100,8 @@ impl AsymDetector {
             rates: HashMap::new(),
             last_snapshot: collector::read(),
             conntrack_rx_bps: None,
+            conntrack_blind: false,
+            warned_blind: false,
         }
     }
 
@@ -142,14 +149,32 @@ impl AsymDetector {
         // collector actually wrote a new snapshot, so the rate spans a real
         // interval instead of collapsing to nothing.
         if let Some(current) = collector::read() {
-            match self.last_snapshot {
-                Some(prev) => {
-                    if let Some(bps) = current.reply_bps_since(&prev) {
-                        self.conntrack_rx_bps = Some(bps);
-                        self.last_snapshot = Some(current);
-                    }
+            // Installed but unable to measure. Drop any rate learned earlier:
+            // accounting can be switched off under a running daemon, and a
+            // stale figure would keep vouching for traffic nobody is watching.
+            self.conntrack_blind = !current.measures_bytes();
+            if self.conntrack_blind {
+                self.conntrack_rx_bps = None;
+                self.last_snapshot = Some(current);
+                if !self.warned_blind {
+                    self.warned_blind = true;
+                    crate::alert::log(
+                        "conntrack byte accounting is off — UDP cannot be corroborated, \
+                         so streams that are being consumed may be reported as unread. \
+                         Fix: sysctl -w net.netfilter.nf_conntrack_acct=1",
+                    );
                 }
-                None => self.last_snapshot = Some(current),
+            } else {
+                self.warned_blind = false;
+                match self.last_snapshot {
+                    Some(prev) => {
+                        if let Some(bps) = current.reply_bps_since(&prev) {
+                            self.conntrack_rx_bps = Some(bps);
+                            self.last_snapshot = Some(current);
+                        }
+                    }
+                    None => self.last_snapshot = Some(current),
+                }
             }
         }
 
@@ -235,7 +260,10 @@ impl AsymDetector {
                 held.as_secs(),
                 hint.as_deref(),
                 routing,
-                accounted,
+                Corroboration {
+                    accounted,
+                    conntrack_blind: self.conntrack_blind,
+                },
             ));
         }
 
@@ -246,6 +274,19 @@ impl AsymDetector {
     }
 }
 
+/// What the corroboration sources were able to see. The two travel together
+/// because the meaning is in the combination: "sockets accounted for 2 Kbps"
+/// with conntrack reporting is evidence of unread traffic, and the same figure
+/// with conntrack blind is evidence of nothing at all.
+#[derive(Clone, Copy)]
+struct Corroboration {
+    /// The best figure any source could account for, if any source could.
+    accounted: Option<f64>,
+    /// conntrack was installed but could not measure, so its silence is not
+    /// evidence. Distinct from it never having been consulted.
+    conntrack_blind: bool,
+}
+
 fn build_alert(
     iface: &str,
     rx_bps: f64,
@@ -253,7 +294,7 @@ fn build_alert(
     held_secs: u64,
     hint: Option<&str>,
     routing: bool,
-    accounted: Option<f64>,
+    seen: Corroboration,
 ) -> Alert {
     let ratio = if rx_bps > 0.0 {
         tx_bps / rx_bps * 100.0
@@ -292,13 +333,29 @@ fn build_alert(
             role::forwarding_ifaces().join(", ")
         ));
     }
-    match accounted {
-        Some(bps) => detail.push_str(&format!(
+    // Name only the sources that actually reported. Crediting a silent source
+    // with a zero is how a consumed UDP stream gets described as unread: `ss`
+    // reports no counters for UDP, so with conntrack blind the honest answer is
+    // that nothing could see this traffic, not that nothing was reading it.
+    match (seen.accounted, seen.conntrack_blind) {
+        (Some(bps), false) => detail.push_str(&format!(
             " Sockets and conntrack together account for only {} of it, so most of this \
              is arriving unread.",
             fmt_bits(bps)
         )),
-        None => detail.push_str(
+        (Some(bps), true) => detail.push_str(&format!(
+            " Sockets account for only {} of it, but conntrack byte accounting is off, \
+             so UDP could not be checked at all — a video or game stream would look \
+             exactly like this. Enable net.netfilter.nf_conntrack_acct=1 to tell them \
+             apart.",
+            fmt_bits(bps)
+        )),
+        (None, true) => detail.push_str(
+            " Nothing could measure this: conntrack byte accounting is off, so UDP is \
+             invisible here. Enable net.netfilter.nf_conntrack_acct=1 before treating \
+             this as unread traffic.",
+        ),
+        (None, false) => detail.push_str(
             " Corroboration did not run, so whether anything is reading this is \
              unverified. Installing collector/ adds conntrack as a second source.",
         ),
