@@ -36,7 +36,11 @@ install -d -m 0755 "$out_dir"
 # figure is used as corroboration -- "is anything consuming this?" -- not as an
 # exact accounting.
 #
-# Requires net.netfilter.nf_conntrack_acct=1, or every bytes= field reads zero.
+# Requires net.netfilter.nf_conntrack_acct=1. With accounting off the kernel
+# omits the bytes= fields entirely, so this reports zero flows and zero bytes --
+# which reads exactly like "nothing is consuming this traffic" and turns every
+# consumed UDP stream into a false alert. Report the setting alongside the
+# numbers so the reader can tell "measured zero" from "could not measure".
 #
 # Summing the live table is NOT a counter -- it is a gauge. Every entry holds
 # bytes-so-far for a flow that will eventually expire and be removed, so the sum
@@ -51,6 +55,14 @@ state="$out_dir/ct.state"
 accum="$out_dir/ct.accum"
 ct_bytes=0
 ct_flows=0
+ct_acct=0
+
+# A missing path means the nf_conntrack module is not loaded, which is the same
+# blindness as accounting being off.
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_acct ]]; then
+    read -r ct_acct < /proc/sys/net/netfilter/nf_conntrack_acct || ct_acct=0
+    [[ "$ct_acct" =~ ^[0-9]+$ ]] || ct_acct=0
+fi
 
 if [[ -r /proc/net/nf_conntrack ]]; then
     prev_total=$(cat "$accum" 2>/dev/null || echo 0)
@@ -132,6 +144,7 @@ fi
 # snapshot. rename(2) within one filesystem is atomic.
 {
     printf 'at=%s\n' "$(date +%s)"
+    printf 'conntrack_acct=%s\n' "${ct_acct:-0}"
     printf 'conntrack_flows=%s\n' "${ct_flows:-0}"
     printf 'conntrack_reply_bytes=%s\n' "${ct_bytes:-0}"
     printf 'input_drop_packets=%s\n' "${drop_packets:-0}"

@@ -26,6 +26,29 @@ install -Dm644 "$here/packetminder-collector.timer" /etc/systemd/system/packetmi
 # turns the QUIC corroboration this exists for into "nothing is consuming
 # anything". Cheap, but not free: the kernel maintains two extra counters per
 # tracked flow.
+#
+# The sysctl alone is not enough, and fails in a way nothing surfaces:
+# /proc/sys/net/netfilter/nf_conntrack_acct does not exist until nf_conntrack is
+# loaded, and nothing loads it early -- on a firewalled desktop it arrives with
+# the firewall's first conntrack rule, racing systemd-sysctl.service. When
+# sysctl wins, the setting is dropped with one ignorable log line:
+#
+#   systemd-sysctl[408]: Couldn't write '1' to 'net/netfilter/nf_conntrack_acct',
+#                        ignoring: No such file or directory
+#
+# and accounting stays off for the whole boot while everything looks installed
+# and healthy. Forcing the module load fixes it for good: systemd-sysctl.service
+# is ordered After=systemd-modules-load.service, so the path is guaranteed to
+# exist by the time the setting is applied.
+echo "==> Loading nf_conntrack early (so the sysctl below has somewhere to land)"
+install -Dm644 /dev/stdin /etc/modules-load.d/packetminder-conntrack.conf <<'EOF'
+# Ordered before systemd-sysctl, which is what makes
+# /etc/sysctl.d/99-packetminder-conntrack-acct.conf apply at boot rather than
+# being dropped as a nonexistent path.
+nf_conntrack
+EOF
+modprobe nf_conntrack 2>/dev/null || true
+
 echo "==> Enabling conntrack byte accounting"
 install -Dm644 /dev/stdin /etc/sysctl.d/99-packetminder-conntrack-acct.conf <<'EOF'
 # Required by packetminder-collector: without it /proc/net/nf_conntrack reports
@@ -49,4 +72,5 @@ echo "  systemctl disable --now packetminder-collector.timer"
 echo "  rm /etc/systemd/system/packetminder-collector.{service,timer}"
 echo "  rm /usr/local/libexec/packetminder-collect"
 echo "  rm /etc/sysctl.d/99-packetminder-conntrack-acct.conf"
+echo "  rm /etc/modules-load.d/packetminder-conntrack.conf"
 echo "  systemctl daemon-reload"

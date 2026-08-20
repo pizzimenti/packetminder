@@ -55,6 +55,12 @@ pub struct AsymDetector {
     last_snapshot: Option<Snapshot>,
     /// Inbound bits/sec conntrack attributed over the last refresh interval.
     conntrack_rx_bps: Option<f64>,
+    /// Why conntrack contributed nothing, when it contributed nothing. Its
+    /// silence proves nothing about UDP either way, but the two reasons need
+    /// different words: one has a fix to prescribe, the other does not.
+    conntrack_gap: Option<ConntrackGap>,
+    /// Log a misconfiguration once per onset, not every tick.
+    warned_blind: bool,
 }
 
 // -- Sampling -----------------------------------------------------------------
@@ -95,6 +101,8 @@ impl AsymDetector {
             rates: HashMap::new(),
             last_snapshot: collector::read(),
             conntrack_rx_bps: None,
+            conntrack_gap: None,
+            warned_blind: false,
         }
     }
 
@@ -142,14 +150,50 @@ impl AsymDetector {
         // collector actually wrote a new snapshot, so the rate spans a real
         // interval instead of collapsing to nothing.
         if let Some(current) = collector::read() {
-            match self.last_snapshot {
-                Some(prev) => {
-                    if let Some(bps) = current.reply_bps_since(&prev) {
-                        self.conntrack_rx_bps = Some(bps);
-                        self.last_snapshot = Some(current);
-                    }
+            // Installed but unable to measure. Drop any rate learned earlier:
+            // accounting can be switched off under a running daemon, and a
+            // stale figure would keep vouching for traffic nobody is watching.
+            self.conntrack_gap = if current.conntrack_acct {
+                // An empty table is an ordinary quiet moment, not a fault --
+                // and prescribing a sysctl that is already set sends the reader
+                // after the wrong thing.
+                (current.conntrack_flows == 0).then_some(ConntrackGap::NoFlows)
+            } else {
+                Some(ConntrackGap::AccountingOff)
+            };
+
+            if self.conntrack_gap.is_some() {
+                self.conntrack_rx_bps = None;
+                // Still advance the baseline, so the first measurable sample
+                // after the gap compares against a snapshot from the same side
+                // of it rather than reaching back across dead time.
+                self.last_snapshot = Some(current);
+                if self.conntrack_gap == Some(ConntrackGap::AccountingOff) && !self.warned_blind {
+                    self.warned_blind = true;
+                    crate::alert::log(
+                        "conntrack byte accounting is off — UDP cannot be corroborated, \
+                         so streams that are being consumed may be reported as unread. \
+                         Fix: sysctl -w net.netfilter.nf_conntrack_acct=1",
+                    );
                 }
-                None => self.last_snapshot = Some(current),
+            } else {
+                self.warned_blind = false;
+                match self.last_snapshot {
+                    // reply_bps_since returns None when either end of the
+                    // interval was unmeasurable, so a gap costs one sample of
+                    // corroboration rather than producing an understated rate.
+                    Some(prev) => match current.reply_bps_since(&prev) {
+                        Some(bps) => {
+                            self.conntrack_rx_bps = Some(bps);
+                            self.last_snapshot = Some(current);
+                        }
+                        None if !prev.measures_bytes() => {
+                            self.last_snapshot = Some(current);
+                        }
+                        None => {}
+                    },
+                    None => self.last_snapshot = Some(current),
+                }
             }
         }
 
@@ -200,13 +244,13 @@ impl AsymDetector {
             // interface concurrent with a large legitimate transfer on another
             // can be masked. That is the honest limit of asking "is anything
             // here consuming this?" without per-flow attribution.
-            let accounted = match (by_socket, self.conntrack_rx_bps) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (only @ Some(_), None) | (None, only @ Some(_)) => only,
-                (None, None) => None,
+            let seen = Corroboration {
+                by_socket,
+                by_conntrack: self.conntrack_rx_bps,
+                gap: self.conntrack_gap,
             };
 
-            if let Some(bps) = accounted
+            if let Some(bps) = seen.accounted()
                 && bps >= rates.rx_bps * cfg.socket_account_ratio
             {
                 let via = match (by_socket, self.conntrack_rx_bps) {
@@ -235,7 +279,7 @@ impl AsymDetector {
                 held.as_secs(),
                 hint.as_deref(),
                 routing,
-                accounted,
+                seen,
             ));
         }
 
@@ -246,6 +290,71 @@ impl AsymDetector {
     }
 }
 
+/// Why conntrack could not contribute, when it could not. The two cases need
+/// different words: one is a misconfiguration with a fix to prescribe, the
+/// other is an ordinary quiet moment that no sysctl will change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConntrackGap {
+    /// nf_conntrack_acct is off, so no flow carries byte counters.
+    AccountingOff,
+    /// Accounting is on but the table was empty, so there was nothing to count.
+    NoFlows,
+}
+
+/// What each corroboration source was able to see, kept per-source rather than
+/// collapsed to a single figure.
+///
+/// The collapse is what made the original bug possible: one number cannot say
+/// whether it came from both sources agreeing or from one source while the
+/// other was blind, and the difference is the whole meaning. "Sockets accounted
+/// for 2 Kbps" alongside a reporting conntrack is evidence of unread traffic;
+/// the identical figure with conntrack blind is evidence of nothing at all,
+/// because `ss` cannot see UDP in the first place.
+#[derive(Clone, Copy, Default)]
+struct Corroboration {
+    /// Established-socket receive rate, when sampled. TCP only.
+    by_socket: Option<f64>,
+    /// conntrack reply rate, when it could be measured. Covers UDP.
+    by_conntrack: Option<f64>,
+    /// Set when conntrack was installed but contributed nothing, so its silence
+    /// must not be read as evidence of absence.
+    gap: Option<ConntrackGap>,
+}
+
+impl Corroboration {
+    /// The best-informed figure available, since each source is blind where the
+    /// other sees. None when nothing could measure at all.
+    fn accounted(&self) -> Option<f64> {
+        match (self.by_socket, self.by_conntrack) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (only @ Some(_), None) | (None, only @ Some(_)) => only,
+            (None, None) => None,
+        }
+    }
+
+    /// Whether UDP could be seen at all. `ss` reports no byte counters for UDP
+    /// sockets, so without conntrack a consumed stream and a flood are
+    /// indistinguishable -- and this is exactly the state a game or video
+    /// stream lands in.
+    fn udp_is_visible(&self) -> bool {
+        self.by_conntrack.is_some()
+    }
+
+    /// Why conntrack contributed nothing, phrased for someone reading an alert.
+    /// An empty table is not a fault and has no fix to prescribe; prescribing a
+    /// sysctl that is already set would send the reader after the wrong thing.
+    fn gap_explanation(&self) -> &'static str {
+        match self.gap {
+            Some(ConntrackGap::AccountingOff) => {
+                "conntrack byte accounting is off, so enable \
+                 net.netfilter.nf_conntrack_acct=1"
+            }
+            Some(ConntrackGap::NoFlows) => "conntrack had no tracked flows to measure",
+            None => "conntrack did not report",
+        }
+    }
+}
+
 fn build_alert(
     iface: &str,
     rx_bps: f64,
@@ -253,7 +362,7 @@ fn build_alert(
     held_secs: u64,
     hint: Option<&str>,
     routing: bool,
-    accounted: Option<f64>,
+    seen: Corroboration,
 ) -> Alert {
     let ratio = if rx_bps > 0.0 {
         tx_bps / rx_bps * 100.0
@@ -261,18 +370,25 @@ fn build_alert(
         0.0
     };
 
+    // Only `title` and `body` reach the popup -- `detail` is journal-only -- so
+    // a caveat that lives in the detail is a caveat the person being
+    // interrupted never sees. When UDP could not be checked, the claim has to
+    // weaken here, where it is read.
+    let verified = seen.udp_is_visible();
     let body = format!(
         "Receiving {}, sending only {} ({:.1}%) for {}.\n{}",
         fmt_bits(rx_bps),
         fmt_bits(tx_bps),
         ratio,
         fmt_duration(held_secs),
-        if routing {
+        match (verified, routing) {
             // The reader needs to know the judgement was made at host scope,
             // or the per-interface numbers above will not add up for them.
-            "This host is forwarding, and no interface is passing it on."
-        } else {
-            "Nothing on this host appears to be answering it."
+            (true, true) => "This host is forwarding, and no interface is passing it on.",
+            (true, false) => "Nothing on this host appears to be answering it.",
+            (false, _) =>
+                "Whether anything is reading this could not be checked — a video or \
+                 game stream looks exactly like this.",
         },
     );
 
@@ -292,24 +408,136 @@ fn build_alert(
             role::forwarding_ifaces().join(", ")
         ));
     }
-    match accounted {
+    // Name only the sources that actually reported. Crediting a silent source
+    // with a zero is how a consumed UDP stream gets described as unread.
+    let sources = match (seen.by_socket, seen.by_conntrack) {
+        (Some(_), Some(_)) => "Sockets and conntrack together account",
+        (Some(_), None) => "Sockets account",
+        (None, Some(_)) => "conntrack accounts",
+        (None, None) => "",
+    };
+    match seen.accounted() {
         Some(bps) => detail.push_str(&format!(
-            " Sockets and conntrack together account for only {} of it, so most of this \
-             is arriving unread.",
-            fmt_bits(bps)
+            " {sources} for only {} of it{}",
+            fmt_bits(bps),
+            if seen.udp_is_visible() {
+                ", so most of this is arriving unread.".to_string()
+            } else {
+                // `ss` cannot see UDP, so a socket figure alone rules nothing out.
+                format!(
+                    ", but UDP could not be checked at all: {}.",
+                    seen.gap_explanation()
+                )
+            }
         )),
-        None => detail.push_str(
-            " Corroboration did not run, so whether anything is reading this is \
-             unverified. Installing collector/ adds conntrack as a second source.",
-        ),
+        None => detail.push_str(&match seen.gap {
+            Some(_) => format!(
+                " Nothing could measure this: {}. Treat the figures above as \
+                 unverified until that is resolved.",
+                seen.gap_explanation()
+            ),
+            None => " Corroboration did not run, so whether anything is reading this is \
+                     unverified. Installing collector/ adds conntrack as a second source."
+                .to_string(),
+        }),
     }
 
     Alert {
         kind: "asymmetric-inbound",
         key: format!("asym-{iface}"),
-        title: format!("Unanswered inbound traffic on {iface}"),
+        title: if verified {
+            format!("Unanswered inbound traffic on {iface}")
+        } else {
+            format!("Unverified inbound traffic on {iface}")
+        },
         body,
         detail,
-        urgency: "critical",
+        // An accusation nothing could substantiate does not earn a critical
+        // interrupt. Still worth saying -- it is how the misconfiguration gets
+        // noticed -- but at the urgency the evidence supports.
+        urgency: if verified { "critical" } else { "normal" },
+    }
+}
+
+// -- Tests --------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert_with(seen: Corroboration) -> Alert {
+        build_alert("wlp1s0", 10_000_000.0, 30_000.0, 60, None, false, seen)
+    }
+
+    /// The popup carries only title and body -- detail is journal-only -- so a
+    /// caveat that lives in the detail is one the interrupted person never
+    /// reads. This is the Moonlight case: a consumed UDP stream, `ss` blind to
+    /// UDP by construction, conntrack unable to measure.
+    #[test]
+    fn a_blind_alert_does_not_accuse_in_the_part_the_user_sees() {
+        let a = alert_with(Corroboration {
+            by_socket: Some(2_000.0),
+            by_conntrack: None,
+            gap: Some(ConntrackGap::AccountingOff),
+        });
+
+        assert!(!a.title.contains("Unanswered"), "title: {}", a.title);
+        assert!(!a.body.contains("Nothing on this host"), "body: {}", a.body);
+        assert!(a.body.contains("could not be checked"), "body: {}", a.body);
+        // An unsubstantiated accusation does not earn a critical interrupt.
+        assert_eq!(a.urgency, "normal");
+        // Only the source that actually reported may be named.
+        assert!(a.detail.contains("Sockets account"), "detail: {}", a.detail);
+        assert!(!a.detail.contains("and conntrack together"));
+    }
+
+    /// With both sources reporting, the original wording and urgency stand --
+    /// the fix must not defang a corroborated finding.
+    #[test]
+    fn a_corroborated_alert_still_accuses() {
+        let a = alert_with(Corroboration {
+            by_socket: Some(2_000.0),
+            by_conntrack: Some(1_000.0),
+            gap: None,
+        });
+
+        assert!(a.title.contains("Unanswered"));
+        assert!(a.body.contains("Nothing on this host appears to be answering it."));
+        assert_eq!(a.urgency, "critical");
+        assert!(a.detail.contains("Sockets and conntrack together account"));
+        assert!(a.detail.contains("arriving unread"));
+    }
+
+    /// An empty conntrack table is an ordinary quiet moment, not a
+    /// misconfiguration -- prescribing a sysctl that is already set sends the
+    /// reader after the wrong thing.
+    #[test]
+    fn an_empty_table_is_not_reported_as_a_disabled_sysctl() {
+        let a = alert_with(Corroboration {
+            by_socket: None,
+            by_conntrack: None,
+            gap: Some(ConntrackGap::NoFlows),
+        });
+
+        assert!(a.detail.contains("no tracked flows"), "detail: {}", a.detail);
+        assert!(
+            !a.detail.contains("nf_conntrack_acct"),
+            "must not prescribe a sysctl that is already on: {}",
+            a.detail
+        );
+    }
+
+    /// conntrack alone must not be described as sockets having reported.
+    #[test]
+    fn conntrack_alone_is_named_alone() {
+        let a = alert_with(Corroboration {
+            by_socket: None,
+            by_conntrack: Some(1_500.0),
+            gap: None,
+        });
+
+        assert!(a.detail.contains("conntrack accounts"), "detail: {}", a.detail);
+        assert!(!a.detail.contains("Sockets"));
+        assert_eq!(a.urgency, "critical");
     }
 }
