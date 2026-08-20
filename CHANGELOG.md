@@ -4,6 +4,44 @@ All notable changes to packetminder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-08-19
+
+A consumed UDP stream (Moonlight game streaming) was reported as "Unanswered
+inbound traffic … Nothing on this host appears to be answering it." Fixed at
+every layer it was wrong.
+
+### Fixed
+
+- **Unmeasured conntrack no longer reads as measured zero.** With
+  `net.netfilter.nf_conntrack_acct` off, the kernel omits every byte counter,
+  and the resulting zero was cited as proof that nothing consumed the traffic.
+  `ss` reports no byte counters for UDP sockets, so conntrack was the only
+  possible witness to a UDP stream — its blindness is now reported as "could
+  not check", never as evidence.
+- **The boot race that turned accounting off.** The sysctl path
+  `/proc/sys/net/netfilter/nf_conntrack_acct` does not exist until the
+  `nf_conntrack` module loads, which on a firewalled desktop happens *after*
+  `systemd-sysctl` runs — so the setting was silently dropped on most boots.
+  The collector installer now ships an `/etc/modules-load.d/` entry;
+  `systemd-sysctl.service` is ordered after `systemd-modules-load.service`, so
+  the setting applies deterministically.
+- **Alerts weaken where they cannot verify — in the popup, not just the
+  journal.** When UDP could not be checked, the notification now reads
+  "Unverified inbound traffic … a video or game stream looks exactly like
+  this" at normal urgency, instead of a critical accusation.
+- **Alert text names only the corroboration sources that actually reported**,
+  and no longer says "Sockets and conntrack together" when only one measured.
+- **No rate is computed across a blind-to-measurable transition**, which
+  understated consumption in exactly the direction that invents alerts.
+- **An empty conntrack table is no longer misdiagnosed** as accounting being
+  off, and no longer prescribes a sysctl that is already set.
+
+### Known limitation
+
+The kernel allocates byte counters only when a flow is created. Streams
+established before accounting was enabled can never be measured and keep
+alerting until they reconnect; correct from the next boot onward.
+
 ## [0.1.0] — 2026-08-07
 
 First release.
@@ -46,4 +84,5 @@ provide) to `/run/packetminder` for the unprivileged daemon to read.
 `packetminder-tui`: a live table of TCP connections with per-connection
 speeds, totals, and whois-resolved ISP names. Panic-safe terminal handling.
 
+[0.1.1]: https://github.com/pizzimenti/packetminder/releases/tag/v0.1.1
 [0.1.0]: https://github.com/pizzimenti/packetminder/releases/tag/v0.1.0

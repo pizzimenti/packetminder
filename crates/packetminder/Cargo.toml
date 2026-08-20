@@ -1,6 +1,6 @@
 [package]
 name = "packetminder"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # let-chains (stable 1.88, edition 2024 only) are the newest feature in use.
 rust-version = "1.88"
