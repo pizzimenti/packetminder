@@ -66,7 +66,11 @@ impl Snapshot {
     }
 
     pub fn reply_bps_since(&self, prev: &Snapshot) -> Option<f64> {
-        if !self.measures_bytes() {
+        // Both ends of the interval have to be measurable. A baseline taken
+        // while conntrack was blind counted nothing, so a rate measured from it
+        // spreads the measurable tail across the blind head and understates the
+        // result -- which is the direction that invents false alerts.
+        if !self.measures_bytes() || !prev.measures_bytes() {
             return None;
         }
         let elapsed = self.at.checked_sub(prev.at)?;
@@ -178,6 +182,25 @@ mod tests {
         let now = parse("at=110\nconntrack_flows=0\nconntrack_reply_bytes=0\n").expect("parses");
         assert!(now.conntrack_acct, "absent field assumes accounting is on");
         assert_eq!(now.reply_bps_since(&prev), None);
+    }
+
+    /// Turning accounting on mid-run must not produce a rate from an interval
+    /// that began while nothing was being counted.
+    #[test]
+    fn the_first_measurable_sample_after_a_gap_yields_no_rate() {
+        let blind = parse("at=100\nconntrack_acct=0\nconntrack_flows=0\nconntrack_reply_bytes=0\n")
+            .expect("parses");
+        let first =
+            parse("at=110\nconntrack_acct=1\nconntrack_flows=9\nconntrack_reply_bytes=10000\n")
+                .expect("parses");
+        let second =
+            parse("at=120\nconntrack_acct=1\nconntrack_flows=9\nconntrack_reply_bytes=20000\n")
+                .expect("parses");
+
+        // Measurable now, but the baseline was not: no rate.
+        assert_eq!(first.reply_bps_since(&blind), None);
+        // Both ends measurable: a rate, and one spanning only measured time.
+        assert_eq!(second.reply_bps_since(&first), Some(8000.0));
     }
 
     /// A real measured zero -- flows tracked, accounting on, nothing consumed --
