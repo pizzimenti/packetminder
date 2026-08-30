@@ -41,6 +41,15 @@ pub struct Alert {
     pub detail: String,
     /// "low" | "normal" | "critical"
     pub urgency: &'static str,
+    /// Whether this is worth putting on screen.
+    ///
+    /// Separate from urgency, which ranks alerts that all deserve a popup.
+    /// Some findings are true, worth recording, and still not events: a
+    /// standing misconfiguration is the same fact every time it is observed,
+    /// and interrupting on each observation is how a real signal becomes
+    /// noise. Those go to the journal with `popup: false` and are read when
+    /// somebody goes looking.
+    pub popup: bool,
 }
 
 // -- Emitting -----------------------------------------------------------------
@@ -71,7 +80,11 @@ pub fn emit(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     }
     log(&line);
 
-    if cfg.notify { notify(cfg, alert) } else { None }
+    if cfg.notify && alert.popup {
+        notify(cfg, alert)
+    } else {
+        None
+    }
 }
 
 /// Write a timestamped line to stderr, which the user unit routes to the

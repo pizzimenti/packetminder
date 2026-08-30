@@ -4,6 +4,37 @@ All notable changes to packetminder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **`discovery-reply`: a LAN device answering a query this host asked is no
+  longer reported as a device flooding it.** Discovery protocols ask over
+  multicast and are answered over unicast, so conntrack cannot match the reply
+  and a default-deny firewall drops it. The record that reaches the log is
+  unicast, from a neighbour, addressed to this host and sustained — the exact
+  signature `blocked-flow` exists to catch, meaning the opposite. Recognised
+  from the source port (SSDP, mDNS, WS-Discovery, LLMNR, NetBIOS, BitTorrent
+  LSD, Plex GDM, Spotify Connect) together with an on-link source and an
+  ephemeral destination; a flood *at* one of those ports still alerts normally.
+- **The alert names the local process that asked**, resolved through
+  `/proc/net/udp` to `/proc/*/fd`. The device in the title answered a question;
+  the program whose discovery is silently broken is never the one the address
+  points at. The same alerts on this machine were Chrome's Cast discovery in
+  early August 2026 and Spotify three weeks later.
+- **`discovery_replies` config key** — `quiet` (default, journal only) |
+  `alert` | `ignore`.
+
+### Changed
+
+- Discovery-reply alerts are keyed on the protocol rather than the destination
+  port. Each discovery round asks from a fresh ephemeral port, so port-keyed
+  alerts made every round a brand-new subject — which is how one broken
+  discovery loop produced a stack of popups rather than one.
+- `Alert` gained a `popup` flag, separate from urgency. Urgency ranks alerts
+  that all deserve the screen; some findings are true, worth recording, and
+  still not events.
+
 ## [0.1.1] — 2026-08-19
 
 A consumed UDP stream (Moonlight game streaming) was reported as "Unanswered

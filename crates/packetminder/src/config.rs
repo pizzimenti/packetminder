@@ -11,6 +11,20 @@ use std::{collections::HashMap, env, fs, path::PathBuf};
 
 // -- Data Structures ----------------------------------------------------------
 
+/// What to do about a firewall drop that is a reply to this host's own
+/// service-discovery query.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DiscoveryReplies {
+    /// Record it, do not interrupt anyone. The default: the finding is real —
+    /// discovery here is broken — but it is a standing configuration fact, not
+    /// an event, and a popup per discovery round is how it was noise before.
+    Quiet,
+    /// Treat it as an ordinary alert, popup included.
+    Alert,
+    /// Drop the records before any detector sees them.
+    Ignore,
+}
+
 // Clone: enrichment threads carry a copy so re-notification does not need to
 // borrow the detector loop's instance across a thread boundary.
 #[derive(Clone)]
@@ -51,6 +65,11 @@ pub struct Config {
     /// listing here. Reach for this only when one specific port is noisy for a
     /// reason those filters cannot see.
     pub ignore_ports: Vec<u16>,
+    /// How to treat drops that are answers to this host's own discovery.
+    ///
+    /// Unlike `ignore_ports` this needs no per-port list: the pattern is
+    /// recognisable from the record itself — see the `discovery` module.
+    pub discovery_replies: DiscoveryReplies,
 
     // -- Self-blocked detector --
     /// Rolling window for judging this host's own blocked traffic, in seconds.
@@ -141,6 +160,12 @@ impl Default for Config {
             block_window_secs: 900,
             block_min_span_secs: 120,
             ignore_ports: Vec::new(),
+            // Quiet rather than ignore: a dropped discovery reply means the
+            // asking program's discovery does not work, and that is worth
+            // being able to find in the log later. It is not worth a popup —
+            // each round asks from a new ephemeral port, so every round would
+            // otherwise be a brand-new flow clearing the threshold again.
+            discovery_replies: DiscoveryReplies::Quiet,
 
             // An hour of context, alerting at half of it. The observed benign
             // case — systemd-resolved's LLMNR retries — is active in about five
@@ -234,6 +259,21 @@ impl Config {
                         None => false,
                     }
                 }
+                "discovery_replies" => match value {
+                    "quiet" => {
+                        cfg.discovery_replies = DiscoveryReplies::Quiet;
+                        true
+                    }
+                    "alert" => {
+                        cfg.discovery_replies = DiscoveryReplies::Alert;
+                        true
+                    }
+                    "ignore" => {
+                        cfg.discovery_replies = DiscoveryReplies::Ignore;
+                        true
+                    }
+                    _ => false,
+                },
                 "self_window_secs" => set_u64(&mut cfg.self_window_secs, value),
                 "self_min_active_minutes" => set_usize(&mut cfg.self_min_active_minutes, value),
                 "self_unicast_min_events" => set_u64(&mut cfg.self_unicast_min_events, value),
@@ -309,6 +349,12 @@ impl Config {
                 .join(",")
         };
 
+        let discovery = match self.discovery_replies {
+            DiscoveryReplies::Quiet => "quiet",
+            DiscoveryReplies::Alert => "alert",
+            DiscoveryReplies::Ignore => "ignore",
+        };
+
         let proto = if self.watch_proto {
             format!(
                 "noports_min_rate={:.0}/s rcvbuf_min_rate={:.0}/s proto_sustain={}s",
@@ -322,6 +368,7 @@ impl Config {
             "interval={}s rx_floor={:.1}Mbps asym_ratio={:.0}% sustain={}s \
              socket_corroboration={} ({:.0}% accounted) \
              block_min_events={} block_min_span={}s ignore_ports={ignored} \
+             discovery_replies={discovery} \
              self_window={}s self_min_active_minutes={} {proto} named_devices={} \
              cooldown={}s notify={}",
             self.interval_secs,
@@ -420,6 +467,13 @@ mod tests {
         }
         assert!(set_ratio(&mut slot, "0"));
         assert!(set_ratio(&mut slot, "1"));
+    }
+
+    #[test]
+    fn discovery_replies_defaults_to_quiet_and_appears_in_the_summary() {
+        let cfg = Config::default();
+        assert_eq!(cfg.discovery_replies, DiscoveryReplies::Quiet);
+        assert!(cfg.summary().contains("discovery_replies=quiet"));
     }
 
     #[test]

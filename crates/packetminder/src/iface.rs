@@ -456,6 +456,7 @@ fn build_alert(
         // interrupt. Still worth saying -- it is how the misconfiguration gets
         // noticed -- but at the urgency the evidence supports.
         urgency: if verified { "critical" } else { "normal" },
+        popup: true,
     }
 }
 

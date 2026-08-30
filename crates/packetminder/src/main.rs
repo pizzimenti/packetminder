@@ -24,6 +24,7 @@
 mod alert;
 mod collector;
 mod config;
+mod discovery;
 mod flows;
 mod iface;
 mod local;
@@ -209,6 +210,7 @@ fn check_ipv6(seen: &mut HashSet<IpAddr>) -> Option<Alert> {
                  own interface, which overrides anything set in /etc/sysctl.d."
             .to_string(),
         urgency: "normal",
+        popup: true,
     })
 }
 
@@ -388,6 +390,7 @@ fn selftest(cfg: Config) {
         body: "If you can read this, notifications work.".to_string(),
         detail: "Emitted by --selftest, not by a detector.".to_string(),
         urgency: "normal",
+        popup: true,
     };
     let waiter = alert::emit(&cfg, &a);
     println!("Emitted a test alert. See: journalctl --user -u packetminder");

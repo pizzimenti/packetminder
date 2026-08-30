@@ -34,7 +34,8 @@ use crate::{
         self, Alert, describe_source, describe_source_cached, device_label_cached, fmt_bytes,
         fmt_duration, identity, identity_cached, is_private, now_epoch, port_in_use,
     },
-    config::Config,
+    config::{Config, DiscoveryReplies},
+    discovery,
     local::{LocalNet, parse_ip},
     selfblock::SelfBlockTracker,
 };
@@ -64,11 +65,15 @@ pub struct SkipCounts {
     pub self_sourced: u64,
     pub group_dest: u64,
     pub ignored_port: u64,
+    /// Answers to this host's own discovery, with `discovery_replies = ignore`
+    /// in force. Under the default `quiet` these are not skipped at all — they
+    /// are tracked and reported, just without a popup.
+    pub discovery_reply: u64,
 }
 
 impl SkipCounts {
     pub fn total(&self) -> u64 {
-        self.self_sourced + self.group_dest + self.ignored_port
+        self.self_sourced + self.group_dest + self.ignored_port + self.discovery_reply
     }
 
     pub fn summary(&self) -> Option<String> {
@@ -77,11 +82,13 @@ impl SkipCounts {
         }
         Some(format!(
             "{} record(s) ignored: {} sent by this host, {} addressed to a multicast \
-             or broadcast group, {} on an ignored port",
+             or broadcast group, {} on an ignored port, {} answering this host's own \
+             discovery",
             self.total(),
             self.self_sourced,
             self.group_dest,
             self.ignored_port,
+            self.discovery_reply,
         ))
     }
 }
@@ -140,6 +147,10 @@ struct FlowFacts {
     duration: String,
     listening: bool,
     nearby: bool,
+    /// Name of the discovery protocol this flow is answering, when the record
+    /// has that shape. Some(..) inverts the meaning of the whole alert: the
+    /// source is replying to us, not transmitting at us.
+    discovery: Option<&'static str>,
 }
 
 // -- Journal Follower ---------------------------------------------------------
@@ -304,6 +315,24 @@ impl FlowTracker {
             return false;
         }
 
+        // Only `ignore` filters here. `quiet` deliberately lets the record
+        // through: the flow is still tracked and still reported, because a
+        // discovery reply being dropped is a true finding about this host's
+        // firewall. It just does not get to raise a popup — that decision
+        // belongs to the alert, not to the intake filter.
+        if cfg.discovery_replies == DiscoveryReplies::Ignore
+            && discovery::classify(
+                &event.proto,
+                event.sport,
+                event.dport,
+                is_nearby(&self.local, &event.src),
+            )
+            .is_some()
+        {
+            self.skipped.discovery_reply += 1;
+            return false;
+        }
+
         true
     }
 
@@ -399,13 +428,13 @@ impl FlowTracker {
 
             let facts = gather_facts(key, state, now, &self.local);
             if self.resolve_inline {
-                alerts.push(compose_alert(&facts, true));
+                alerts.push(compose_alert(&facts, true, cfg));
             } else {
                 // Emit with whatever the caches hold right now — the loop must
                 // not wait on getent or whois. Enrichment is queued, not
                 // spawned: it starts only once the caller has actually emitted
                 // this alert, via spawn_pending_enrichment.
-                let bare = compose_alert(&facts, false);
+                let bare = compose_alert(&facts, false, cfg);
                 self.pending_enrich.push((facts, bare.clone()));
                 alerts.push(bare);
             }
@@ -450,7 +479,18 @@ impl FlowTracker {
     }
 }
 
+/// Whether an address is something other than the internet.
+///
+/// Two conditions, and both are needed. On a subnet this host is attached to is
+/// the only one that means anything under IPv6. Private v4 space is the
+/// fallback: it still holds when address discovery has failed, and it covers a
+/// LAN host reached through a router.
+fn is_nearby(local: &LocalNet, src: &str) -> bool {
+    parse_ip(src).is_some_and(|ip| local.is_on_link(&ip)) || is_private(src)
+}
+
 fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) -> FlowFacts {
+    let nearby = is_nearby(local, &key.src);
     FlowFacts {
         src: key.src.clone(),
         proto_lower: key.proto.to_lowercase(),
@@ -461,20 +501,19 @@ fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) ->
         iface: state.iface.clone(),
         duration: fmt_duration((now - state.first).max(0) as u64),
         listening: port_in_use(&key.proto, key.dport),
-        // "Not the internet" is two conditions, and both are needed. On a
-        // subnet this host is attached to is the only one that means anything
-        // under IPv6. Private v4 space is the fallback: it still holds when
-        // address discovery has failed, and it covers a LAN host reached
-        // through a router.
-        nearby: parse_ip(&key.src).is_some_and(|ip| local.is_on_link(&ip))
-            || is_private(&key.src),
+        nearby,
+        discovery: discovery::classify(&key.proto, state.sport, key.dport, nearby),
     }
 }
 
 /// Build the alert from gathered facts. With `resolve` the lookups may wait on
 /// the network; without it only caches are consulted, so it is safe on the
 /// detector loop.
-fn compose_alert(facts: &FlowFacts, resolve: bool) -> Alert {
+fn compose_alert(facts: &FlowFacts, resolve: bool, cfg: &Config) -> Alert {
+    if let Some(protocol) = facts.discovery {
+        return compose_discovery_alert(facts, protocol, resolve, cfg);
+    }
+
     let proto = &facts.proto_lower;
 
     // Line one is what we worked out the device is; line two is what it did.
@@ -539,6 +578,94 @@ fn compose_alert(facts: &FlowFacts, resolve: bool) -> Alert {
         body,
         detail,
         urgency,
+        popup: true,
+    }
+}
+
+/// The same flow, told the right way round.
+///
+/// The blocked-flow wording accuses the source of transmitting into a host that
+/// is not listening. Here the source answered a question this host asked, so
+/// every part of that sentence is wrong, and the useful name is not the device
+/// in the title but the local process holding the querying socket.
+fn compose_discovery_alert(
+    facts: &FlowFacts,
+    protocol: &str,
+    resolve: bool,
+    cfg: &Config,
+) -> Alert {
+    let (who, derived) = if resolve {
+        identity(&facts.src)
+    } else {
+        identity_cached(&facts.src)
+    };
+
+    // Reading /proc for the owning process is the same class of cost as getent
+    // and whois, so it lives on the same side of the bare/enriched split and
+    // never runs on the detector loop.
+    let asker = if resolve {
+        discovery::asker(&facts.proto_lower, facts.dport)
+    } else {
+        None
+    };
+
+    let mut body = String::new();
+    if let Some(d) = &derived {
+        body.push_str(d);
+        body.push('\n');
+    }
+    let asked = match (&asker, facts.listening) {
+        (Some(comm), _) => format!("{comm} asked"),
+        // The socket is open but unattributable: another user owns it, or it
+        // closed between the two lookups.
+        (None, true) => "the asking socket is still open".to_string(),
+        // The reply outran its own query. Ordinary for a discovery round that
+        // finished before the last answer arrived.
+        (None, false) => "the asking socket has already closed".to_string(),
+    };
+    body.push_str(&format!(
+        "Answering this host's own {protocol} discovery — {asked}, and the firewall dropped \
+         the reply. {} drops over {} on {}. Discovery is broken here, not an intrusion.",
+        facts.total, facts.duration, facts.iface,
+    ));
+
+    let mut detail = format!(
+        "{} logged. The query went out to a multicast group and the answer came back unicast \
+         from {}",
+        fmt_bytes(facts.bytes),
+        facts.src,
+    );
+    if facts.sport != 0 {
+        detail.push_str(&format!(":{}", facts.sport));
+    }
+    detail.push_str(
+        ", so conntrack has no entry to match it against and a default-deny input chain drops \
+         it. To make discovery work, allow inbound udp from the local subnet; to make it stop, \
+         turn discovery off in the program that asks. Neither is urgent: nothing is being sent \
+         at this host that it did not ask for.",
+    );
+    let source = if resolve {
+        describe_source(&facts.src, facts.nearby)
+    } else {
+        describe_source_cached(&facts.src, facts.nearby)
+    };
+    detail.push_str(&format!(" Source: {source}"));
+
+    Alert {
+        kind: "discovery-reply",
+        // Keyed on the protocol rather than the destination port, because the
+        // port is a fresh ephemeral one every discovery round. Keying on it
+        // made each round a brand-new subject, which is how one broken
+        // discovery loop produced a stack of popups instead of one.
+        key: format!("discovery-{}-{}", facts.src, protocol),
+        title: format!("{who} — {protocol} reply dropped"),
+        body,
+        detail,
+        // A standing configuration fact, correctly explained, about traffic
+        // this host solicited. It is worth recording every time and worth
+        // interrupting for approximately never.
+        urgency: "low",
+        popup: cfg.discovery_replies == DiscoveryReplies::Alert,
     }
 }
 
@@ -575,7 +702,7 @@ fn spawn_enrichment(cfg: Config, facts: FlowFacts, bare: Alert) {
     }
     thread::spawn(move || {
         let _slot = EnricherSlot;
-        let enriched = compose_alert(&facts, true);
+        let enriched = compose_alert(&facts, true, &cfg);
         if enriched.title != bare.title
             || enriched.body != bare.body
             || enriched.detail != bare.detail
@@ -655,6 +782,24 @@ mod tests {
         IN=wlp1s0 OUT= MAC= SRC=fe80:0000:0000:0000:b787:4f5d:1cbb:eb39 \
         DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=74 TC=0 HOPLIMIT=255 FLOWLBL=258456 \
         PROTO=UDP SPT=5355 DPT=5355 LEN=34";
+
+    /// The false positive this reads backwards: a Roku answering an SSDP
+    /// M-SEARCH that this host multicast. Unicast from a neighbour, addressed
+    /// to this host, sustained — indistinguishable from SAMPLE except that the
+    /// source port says it is a reply.
+    const SSDP_REPLY: &str = "2026-08-28T00:42:04-07:00 ithilien kernel: [UFW BLOCK] IN=wlp1s0 \
+        OUT= MAC=3c:3b:ad:16:b7:30:a8:b5:7c:53:b2:fe:08:00 SRC=10.3.193.195 DST=10.3.153.246 \
+        LEN=328 TOS=0x00 PREC=0x00 TTL=64 ID=46308 DF PROTO=UDP SPT=1900 DPT=43285 LEN=308";
+
+    /// Feed a record in often enough and long enough to clear both thresholds.
+    fn sustain(tracker: &mut FlowTracker, cfg: &Config, record: &str, base: i64) -> Vec<Alert> {
+        for i in 0..6 {
+            let mut event = parse_line(record).expect("should parse");
+            event.ts = base + i * 40;
+            tracker.record(event, cfg);
+        }
+        tracker.tick_at(cfg, base + 200)
+    }
 
     /// A tracker that believes it owns this machine's addresses, so tests never
     /// depend on whatever the host running them actually has configured.
@@ -765,6 +910,70 @@ mod tests {
         event.dst = "10.3.255.255".into();
         assert!(!tracker.record(event, &cfg));
         assert_eq!(tracker.skipped().group_dest, 1);
+    }
+
+    #[test]
+    fn a_reply_to_our_own_discovery_is_reported_but_never_pops_up() {
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let alerts = sustain(&mut tracker, &cfg, SSDP_REPLY, 1_787_000_000);
+
+        assert_eq!(alerts.len(), 1, "the flow is still reported");
+        let a = &alerts[0];
+        assert_eq!(a.kind, "discovery-reply", "not a flood, and must not say so");
+        assert!(!a.popup, "quiet is the default: journal only");
+        assert!(a.body.contains("SSDP"), "the protocol has to be named: {}", a.body);
+        assert!(
+            !a.body.contains("Nothing is listening"),
+            "the blocked-flow wording must not leak into this: {}",
+            a.body
+        );
+        // Keyed on the protocol, not the ephemeral port, so the next discovery
+        // round replaces this rather than stacking beside it.
+        assert_eq!(a.key, "discovery-10.3.193.195-SSDP");
+    }
+
+    #[test]
+    fn discovery_replies_can_be_asked_for_or_filtered_outright() {
+        let base = 1_787_000_000;
+
+        let alert_cfg = Config {
+            discovery_replies: DiscoveryReplies::Alert,
+            ..Config::default()
+        };
+        let mut asked_for = tracker();
+        let alerts = sustain(&mut asked_for, &alert_cfg, SSDP_REPLY, base);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].popup, "`alert` opts back in to the popup");
+        assert_eq!(alerts[0].urgency, "low", "explained and benign, even when shown");
+
+        let ignore_cfg = Config {
+            discovery_replies: DiscoveryReplies::Ignore,
+            ..Config::default()
+        };
+        let mut filtered = tracker();
+        for i in 0..6 {
+            let mut event = parse_line(SSDP_REPLY).expect("should parse");
+            event.ts = base + i * 40;
+            assert!(!filtered.record(event, &ignore_cfg), "must not reach the tracker");
+        }
+        assert!(filtered.tick_at(&ignore_cfg, base + 200).is_empty());
+        assert_eq!(filtered.skipped().discovery_reply, 6);
+    }
+
+    #[test]
+    fn a_real_flood_is_untouched_by_the_discovery_rule() {
+        // The Sunshine stream this daemon was written for. Same shape, same
+        // neighbour, same sustained unicast — and its source port is not a
+        // discovery port, so none of the above may apply to it.
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let alerts = sustain(&mut tracker, &cfg, SAMPLE, 1_785_743_453);
+
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "blocked-flow");
+        assert!(alerts[0].popup, "a real flood still interrupts");
+        assert_eq!(alerts[0].urgency, "critical");
     }
 
     #[test]

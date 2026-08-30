@@ -32,6 +32,7 @@ Detectors, deliberately at different layers than the TUI:
 | --- | --- | --- |
 | `asymmetric-inbound` | `/proc/net/dev` counters | Sustained inbound with near-zero outbound. A host that is genuinely downloading also sends — ACKs, QUIC acks, control traffic. Bulk TCP runs ~2.2% outbound, so under 2% means this host is probably not part of the conversation. See the caveat below. |
 | `blocked-flow` | kernel log, `[UFW BLOCK]` records | One source being dropped repeatedly for minutes, grouped by (source, protocol, destination port). Names the culprit exactly, and reports whether anything is actually listening on that port. |
+| `discovery-reply` | the same records, read the other way round | A LAN device *answering* a discovery query this host sent — dropped on arrival because the query went to a multicast group and the answer came back unicast. Journal-only by default, and it names the local process that asked. See below. |
 | `self-blocked` | the records `blocked-flow` rejects | Traffic *this host* sends that its own firewall drops. Not an attack, but not nothing — see below. |
 | `udp-no-listener` | `Udp.NoPorts`, `/proc/net/snmp` | Datagrams the kernel delivered to a port with no socket. The premise of this daemon, counted at the source — and unlike the drop log it covers traffic the firewall *allows* through to a dead port. |
 | `receive-overflow` | `Udp.RcvbufErrors`, `TcpExt.ListenDrops` | Traffic dropped because a receive queue was full. The inverse problem: something *is* listening and cannot keep up. Invisible everywhere else, because from outside it looks like traffic being consumed. |
@@ -138,6 +139,53 @@ replay attributed only 16 records to this host against 361 that were actually
 locally generated, because the rest arrived under addresses it no longer has.
 Live operation re-reads every 60 seconds and gets it right.
 
+## Answers to questions this host asked
+
+A third class of record survives both structural filters and still means the
+opposite of what `blocked-flow` would say about it: the reply to a
+service-discovery query this host sent itself.
+
+Discovery asks over multicast and is answered over unicast. The query leaves for
+`239.255.255.250:1900`; the answer arrives from `10.3.193.195:1900`. Conntrack
+tracked the first and cannot match the second — a different peer address
+entirely — so the reply reaches the input path unsolicited and a default-deny
+firewall drops it. The record that lands in the log is unicast, from a
+neighbour, addressed to this host, and repeated for as long as the asking
+program keeps asking. That is the exact signature `blocked-flow` exists to
+catch, and here it is backwards: nobody is transmitting at this host.
+
+The tell is the **source** port. Each of these protocols answers *from* its own
+well-known port — 1900 SSDP, 5353 mDNS, 3702 WS-Discovery, 5355 LLMNR, 137/138
+NetBIOS, 6771 BitTorrent LSD, 32412/32414 Plex GDM, 57621 Spotify Connect — and
+the answer lands on whatever ephemeral port the query went out from. All four
+conditions are required: UDP, an on-link or private source, a listed source
+port, and a destination port that is ephemeral and not itself a discovery port.
+Together they cannot describe a flood, which is the point: a flood *at* udp/1900
+stays a flood, and the observed 2.7 Mbps stream that this daemon was written for
+does not match on any of the four.
+
+The alert names the local process holding the querying socket, resolved through
+`/proc/net/udp` to `/proc/*/fd`. That matters more than the device does. The
+device in the title is the innocent party — it answered a question — while the
+program whose discovery is silently failing is never the one the address points
+at. On this machine the asker was Chrome's Cast discovery in August 2026 and
+Spotify three weeks later, for identical-looking alerts.
+
+It is journal-only by default. The finding is true — discovery here does not
+work — but it is a standing configuration fact, not an event, and each discovery
+round asks from a *new* ephemeral port, so every round would otherwise clear the
+threshold as a brand-new flow and pop up again. The alert is keyed on the
+protocol rather than the port for the same reason.
+
+`discovery_replies` chooses: `quiet` (default) records without a popup, `alert`
+opts back in at `low` urgency, `ignore` discards the records before any detector
+sees them. Prefer `quiet` — `ignore` gives up the ability to answer "why can't
+this machine see the Chromecast?" later.
+
+To make discovery actually work rather than merely explaining itself, allow
+inbound UDP from the local subnet; to make it stop, turn discovery off in the
+program that asks.
+
 ## Watching IPv6
 
 Every address test here — self-sourced, group-addressed, on-link — already
@@ -240,7 +288,8 @@ limit changes that.
 at startup only; restart the service after editing.
 
 Defaults: 1 Mbps inbound floor, 2% asymmetry ratio held for 60s, 4 drop records
-spanning 2 minutes, 30-minute cooldown per subject, no ignored ports.
+spanning 2 minutes, 30-minute cooldown per subject, no ignored ports, and
+discovery replies recorded quietly.
 
 ### The asymmetry ratio cannot be exact
 
@@ -260,6 +309,10 @@ tuning a ratio.
 typo in one entry keeps the default rather than silently widening the blind
 spot. Prefer leaving it empty; if a port is noisy, the reason is usually
 something the structural filters above should be catching instead.
+
+`discovery_replies` takes `quiet` | `alert` | `ignore`, and needs no port list
+because the pattern is recognisable from the record itself. An unrecognised
+value keeps the default rather than guessing.
 
 ### Naming devices
 
