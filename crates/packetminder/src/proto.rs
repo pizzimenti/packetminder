@@ -145,6 +145,7 @@ fn no_listener_alert(rate: f64, held: u64) -> Alert {
                  `ss -uan` shows nothing bound to."
             .to_string(),
         urgency: "normal",
+        popup: true,
     }
 }
 
@@ -163,6 +164,7 @@ fn overflow_alert(rate: f64, held: u64) -> Alert {
                  which socket is backed up."
             .to_string(),
         urgency: "critical",
+        popup: true,
     }
 }
 

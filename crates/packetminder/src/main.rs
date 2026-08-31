@@ -24,6 +24,7 @@
 mod alert;
 mod collector;
 mod config;
+mod discovery;
 mod flows;
 mod iface;
 mod local;
@@ -209,6 +210,7 @@ fn check_ipv6(seen: &mut HashSet<IpAddr>) -> Option<Alert> {
                  own interface, which overrides anything set in /etc/sysctl.d."
             .to_string(),
         urgency: "normal",
+        popup: true,
     })
 }
 
@@ -288,6 +290,18 @@ fn replay(cfg: Config, since: &str) {
     // were discarded on purpose", never as an unexplained absence of results.
     if let Some(skipped) = tracker.skipped().summary() {
         println!("{skipped}\n");
+    }
+
+    // Corroborating a discovery reply means asking whether a socket is bound to
+    // the port it answered, and only today's socket table can be asked. Live,
+    // that question is put while the asking program still holds the socket;
+    // here it is put days later, when it does not. Replay therefore reports
+    // more "unsolicited" replies than the daemon ever would.
+    if alerts.iter().any(|(_, a)| a.kind == "discovery-reply") {
+        println!(
+            "Note: discovery replies are corroborated against the socket table as it is *now*, \
+             so historical rounds read as unsolicited more often than they did at the time.\n"
+        );
     }
 
     if alerts.is_empty() {
@@ -388,6 +402,7 @@ fn selftest(cfg: Config) {
         body: "If you can read this, notifications work.".to_string(),
         detail: "Emitted by --selftest, not by a detector.".to_string(),
         urgency: "normal",
+        popup: true,
     };
     let waiter = alert::emit(&cfg, &a);
     println!("Emitted a test alert. See: journalctl --user -u packetminder");

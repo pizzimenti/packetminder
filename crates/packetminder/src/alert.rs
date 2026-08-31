@@ -41,6 +41,15 @@ pub struct Alert {
     pub detail: String,
     /// "low" | "normal" | "critical"
     pub urgency: &'static str,
+    /// Whether this is worth putting on screen.
+    ///
+    /// Separate from urgency, which ranks alerts that all deserve a popup.
+    /// Some findings are true, worth recording, and still not events: a
+    /// standing misconfiguration is the same fact every time it is observed,
+    /// and interrupting on each observation is how a real signal becomes
+    /// noise. Those go to the journal with `popup: false` and are read when
+    /// somebody goes looking.
+    pub popup: bool,
 }
 
 // -- Emitting -----------------------------------------------------------------
@@ -71,7 +80,11 @@ pub fn emit(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     }
     log(&line);
 
-    if cfg.notify { notify(cfg, alert) } else { None }
+    if cfg.notify && alert.popup {
+        notify(cfg, alert)
+    } else {
+        None
+    }
 }
 
 /// Write a timestamped line to stderr, which the user unit routes to the
@@ -617,9 +630,14 @@ fn describe_source_at(ip: &str, nearby: bool, resolve: bool) -> String {
 /// True for RFC1918, CGNAT, link-local and loopback space.
 pub fn is_private(ip: &str) -> bool {
     let Ok(addr) = ip.parse::<Ipv4Addr>() else {
-        // Treat IPv6 ULA/link-local as private; anything else public.
+        // Treat IPv6 ULA/link-local as private; anything else public. ULA is
+        // fc00::/7 — both halves, even though RFC 4193 only ever assigns from
+        // fd00::/8 in practice.
         let lower = ip.to_lowercase();
-        return lower.starts_with("fd") || lower.starts_with("fe80") || lower == "::1";
+        return lower.starts_with("fc")
+            || lower.starts_with("fd")
+            || lower.starts_with("fe80")
+            || lower == "::1";
     };
     let [a, b, ..] = addr.octets();
     addr.is_private()

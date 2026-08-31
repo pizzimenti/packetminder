@@ -236,6 +236,7 @@ fn build_alert(key: &SelfKey, state: &SelfState, cfg: &Config, now: i64) -> Aler
         body,
         detail,
         urgency,
+        popup: true,
     }
 }
 

@@ -59,6 +59,17 @@ if [[ ! -f "$config_dir/packetminder.conf" ]]; then
 # broadcast group, are already filtered structurally. Parsed all-or-nothing,
 # so a typo keeps the default rather than widening the blind spot.
 # ignore_ports = 5355, 5353
+#
+# What to do about drops that are a LAN device *answering* a discovery query
+# this host sent. Discovery asks over multicast and is answered over unicast,
+# so conntrack cannot match the reply and a default-deny firewall drops it --
+# which looks exactly like a flood and means the opposite. Recognised from the
+# source port, so no port list is needed.
+#   quiet   record it, no popup (default). The alert names the local process
+#           that asked, which is the one whose discovery is actually broken.
+#   alert   put it on screen too, at low urgency.
+#   ignore  discard the records before any detector sees them.
+# discovery_replies = quiet
 
 # -- Self-blocked detector --
 # Traffic this host sends that its own firewall drops. Thresholded on how many
