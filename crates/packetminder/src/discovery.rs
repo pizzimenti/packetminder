@@ -211,16 +211,21 @@ fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
 /// Whether a socket bound to `local` could have received a packet sent to
 /// `destination`.
 ///
-/// A wildcard binding takes everything, including the v4-mapped traffic an
-/// IPv6 wildcard socket receives on a dual-stack host. Otherwise the addresses
+/// Wildcards are wildcards only within their reach: an IPv6 wildcard takes
+/// everything on a dual-stack host, v4-mapped traffic included, but an IPv4
+/// wildcard never sees a single IPv6 packet — `0.0.0.0` and `[::]` both answer
+/// `is_unspecified()`, and treating them alike would let a v4-only socket
+/// corroborate v6-addressed traffic it cannot receive. Otherwise the addresses
 /// have to be the same one. An unparseable destination corroborates nothing —
 /// the safe direction, since failing to corroborate only means the alert keeps
 /// its popup.
 fn could_receive(local: &IpAddr, destination: Option<IpAddr>) -> bool {
-    if local.is_unspecified() {
-        return true;
+    match (local, destination) {
+        (_, None) => false,
+        (IpAddr::V6(bound), Some(_)) if bound.is_unspecified() => true,
+        (IpAddr::V4(bound), Some(IpAddr::V4(_))) if bound.is_unspecified() => true,
+        (bound, Some(dst)) => *bound == dst,
     }
-    destination.is_some_and(|dst| *local == dst)
 }
 
 /// Parse the hex local address /proc/net writes: a little-endian u32 per word,
@@ -391,6 +396,33 @@ mod tests {
             solicited_locally("UDP", "127.0.0.1", port),
             "the same socket does account for loopback-addressed traffic"
         );
+    }
+
+    #[test]
+    fn a_wildcard_is_only_a_wildcard_within_its_own_family() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let v4_any = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let v6_any = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+        let v4_dst = parse_ip("10.3.153.246");
+        let v6_dst = parse_ip("fe80:0000:0000:0000:b787:4f5d:1cbb:eb39");
+
+        // 0.0.0.0 and [::] both answer is_unspecified(), but only one of them
+        // can receive traffic from the other family.
+        assert!(could_receive(&v4_any, v4_dst));
+        assert!(
+            !could_receive(&v4_any, v6_dst),
+            "a v4-only wildcard never sees an IPv6 packet and must not corroborate one"
+        );
+        assert!(could_receive(&v6_any, v6_dst));
+        assert!(
+            could_receive(&v6_any, v4_dst),
+            "a dual-stack v6 wildcard receives v4-mapped traffic"
+        );
+
+        // No wildcard corroborates a destination that did not parse.
+        assert!(!could_receive(&v6_any, None));
+        assert!(!could_receive(&v4_any, None));
     }
 
     #[test]
