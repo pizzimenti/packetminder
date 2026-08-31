@@ -159,10 +159,35 @@ well-known port — 1900 SSDP, 5353 mDNS, 3702 WS-Discovery, 5355 LLMNR, 137/138
 NetBIOS, 6771 BitTorrent LSD, 32412/32414 Plex GDM, 57621 Spotify Connect — and
 the answer lands on whatever ephemeral port the query went out from. All four
 conditions are required: UDP, an on-link or private source, a listed source
-port, and a destination port that is ephemeral and not itself a discovery port.
-Together they cannot describe a flood, which is the point: a flood *at* udp/1900
-stays a flood, and the observed 2.7 Mbps stream that this daemon was written for
-does not match on any of the four.
+port, and a destination port inside the kernel's own ephemeral range
+(`/proc/sys/net/ipv4/ip_local_port_range`) that is not itself a discovery port.
+A flood *at* udp/1900 stays a flood, and the 2.7 Mbps stream this daemon was
+written for matches none of the four.
+
+### What the source port cannot prove
+
+A source port is chosen by the sender. A peer already on the LAN can send from
+udp/1900 into the ephemeral range without this host ever having asked anything,
+and it matches every condition above. **Shape alone therefore silences nothing.**
+
+The second question is whether a local socket is actually bound to the port
+being answered — the only evidence available that this host asked:
+
+| Evidence | Reported as | Popup |
+| --- | --- | --- |
+| Socket bound to the destination port | `discovery-reply`, `low` | No (default) |
+| No socket bound | `discovery-reply`, `normal`, titled *unsolicited* | **Yes** |
+
+A dismissal nothing could substantiate does not earn silence, any more than an
+accusation nothing could substantiate earns a critical popup — the same rule
+`asymmetric-inbound` applies to itself, pointed the other way. `ignore` is how
+you opt out of the distinction deliberately.
+
+Two things bound the residual risk. The volume-sensitive detectors
+(`asymmetric-inbound` from interface counters, `udp-no-listener` from
+`Udp.NoPorts`) never consult the drop log's source port, so nothing decided here
+can hide a flood from them. And `quiet` still writes every occurrence to the
+journal — it suppresses the interrupt, not the record.
 
 The alert names the local process holding the querying socket, resolved through
 `/proc/net/udp` to `/proc/*/fd`. That matters more than the device does. The
@@ -171,11 +196,19 @@ program whose discovery is silently failing is never the one the address points
 at. On this machine the asker was Chrome's Cast discovery in August 2026 and
 Spotify three weeks later, for identical-looking alerts.
 
-It is journal-only by default. The finding is true — discovery here does not
-work — but it is a standing configuration fact, not an event, and each discovery
-round asks from a *new* ephemeral port, so every round would otherwise clear the
-threshold as a brand-new flow and pop up again. The alert is keyed on the
-protocol rather than the port for the same reason.
+A corroborated reply is journal-only by default. The finding is true — discovery
+here does not work — but it is a standing configuration fact, not an event.
+
+Each discovery round asks from a *new* ephemeral port, which breaks cooldown in
+a way worth naming: every round is a new flow carrying no memory of the last
+one, so a per-flow cooldown never fires and every round alerts as if it were the
+first. Both the cooldown and the notification key are therefore held against the
+**(device, protocol)** pair rather than the port. That is the subject a human
+would recognise as "this again".
+
+When the flow ends it signs off as `discovery-reply-ended`, not
+`blocked-flow-ended` — an explanation that only holds on the way in is not an
+explanation.
 
 `discovery_replies` chooses: `quiet` (default) records without a popup, `alert`
 opts back in at `low` urgency, `ignore` discards the records before any detector
@@ -313,6 +346,12 @@ something the structural filters above should be catching instead.
 `discovery_replies` takes `quiet` | `alert` | `ignore`, and needs no port list
 because the pattern is recognisable from the record itself. An unrecognised
 value keeps the default rather than guessing.
+
+`quiet` suppresses the popup only for replies it could corroborate against a
+bound local socket; uncorroborated ones still interrupt. `ignore` drops the
+records before any detector sees them, corroborated or not — which is the only
+setting that can hide a peer sending from a discovery port, and is why it is not
+the default.
 
 ### Naming devices
 

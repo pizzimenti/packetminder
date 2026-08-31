@@ -111,6 +111,16 @@ struct FlowState {
     sport: u16,
     bytes: u64,
     alerted_at: Option<i64>,
+    /// The discovery protocol this flow answers, decided from the first record
+    /// and kept. Classification depends on the source port, which is constant
+    /// for a genuine reply stream; re-deciding it per packet would let one odd
+    /// record reclassify a flow mid-life.
+    discovery: Option<&'static str>,
+    /// What the flow was actually *reported* as, once it has alerted. The
+    /// wording when the flow ends has to match the wording when it started, or
+    /// a discovery round that quietly explained itself signs off as a blocked
+    /// flow.
+    alerted_as_discovery: Option<&'static str>,
 }
 
 pub struct FlowTracker {
@@ -130,6 +140,15 @@ pub struct FlowTracker {
     /// enriched popup first, only for the bare one to replace it through the
     /// same dedup key. The caller drains this *after* emitting.
     pending_enrich: Vec<(FlowFacts, Alert)>,
+    /// When each (source, protocol) pair last raised a discovery alert.
+    ///
+    /// Cooldown cannot live on the flow here, the way it does for every other
+    /// detector. Each discovery round asks from a *fresh* ephemeral port, so
+    /// each round is a new `FlowKey` carrying `alerted_at: None` and clears the
+    /// cooldown that was meant to hold it back. The subject that actually
+    /// repeats is the device-and-protocol pair, so the cooldown has to be kept
+    /// against that instead.
+    discovery_alerted: HashMap<(String, &'static str), i64>,
 }
 
 /// Everything an alert says about a flow, copied out of the tracker so a
@@ -251,6 +270,7 @@ impl FlowTracker {
             selfblock: SelfBlockTracker::new(),
             resolve_inline: false,
             pending_enrich: Vec::new(),
+            discovery_alerted: HashMap::new(),
         }
     }
 
@@ -348,6 +368,13 @@ impl FlowTracker {
             dport: event.dport,
         };
 
+        let classified = discovery::classify(
+            &event.proto,
+            event.sport,
+            event.dport,
+            is_nearby(&self.local, &event.src),
+        );
+
         let state = self.flows.entry(key).or_insert_with(|| FlowState {
             times: VecDeque::new(),
             total: 0,
@@ -357,6 +384,8 @@ impl FlowTracker {
             sport: event.sport,
             bytes: 0,
             alerted_at: None,
+            discovery: classified,
+            alerted_as_discovery: None,
         });
 
         state.times.push_back(event.ts);
@@ -394,16 +423,24 @@ impl FlowTracker {
             if state.times.is_empty() {
                 if now - state.last > window {
                     if state.alerted_at.is_some() {
-                        alert::log(
-                            &format!(
-                                "blocked-flow-ended — {} → {}/{} stopped after {} ({} drops logged)",
-                                device_label_cached(&key.src),
-                                key.proto.to_lowercase(),
-                                key.dport,
-                                fmt_duration((state.last - state.first).max(0) as u64),
-                                state.total,
+                        // Sign off the same way it was announced. A discovery
+                        // round that explained itself on the way in must not
+                        // sign off as a blocked flow on the way out.
+                        let (kind, subject) = match state.alerted_as_discovery {
+                            Some(protocol) => {
+                                ("discovery-reply-ended", format!("{protocol} replies"))
+                            }
+                            None => (
+                                "blocked-flow-ended",
+                                format!("{}/{}", key.proto.to_lowercase(), key.dport),
                             ),
-                        );
+                        };
+                        alert::log(&format!(
+                            "{kind} — {} → {subject} stopped after {} ({} drops logged)",
+                            device_label_cached(&key.src),
+                            fmt_duration((state.last - state.first).max(0) as u64),
+                            state.total,
+                        ));
                     }
                     finished.push(key.clone());
                 }
@@ -424,7 +461,26 @@ impl FlowTracker {
                 continue;
             }
 
+            // A discovery flow's own cooldown is worthless, because the flow
+            // itself is new every round. Hold it against the (device, protocol)
+            // pair, which is what a human would recognise as "this again".
+            if let Some(protocol) = state.discovery {
+                let subject = (key.src.clone(), protocol);
+                let repeat = self
+                    .discovery_alerted
+                    .get(&subject)
+                    .is_some_and(|last| now - last < cfg.cooldown_secs as i64);
+                if repeat {
+                    // Still mark the flow, so a round that is suppressed here
+                    // does not re-evaluate on every subsequent tick.
+                    state.alerted_at = Some(now);
+                    continue;
+                }
+                self.discovery_alerted.insert(subject, now);
+            }
+
             state.alerted_at = Some(now);
+            state.alerted_as_discovery = state.discovery;
 
             let facts = gather_facts(key, state, now, &self.local);
             if self.resolve_inline {
@@ -443,6 +499,15 @@ impl FlowTracker {
         for key in finished {
             self.flows.remove(&key);
         }
+
+        // Cooldown entries outlive the flows they were recorded against, by
+        // design — that is the point of keying on the device rather than the
+        // port. Drop them once they can no longer suppress anything, so a
+        // long-running daemon on a busy segment does not accumulate one entry
+        // per device-protocol pair forever.
+        let stale = cfg.cooldown_secs as i64;
+        self.discovery_alerted
+            .retain(|_, last| now - *last < stale);
 
         alerts.extend(self.selfblock.tick_at(cfg, now));
         alerts
@@ -502,7 +567,8 @@ fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) ->
         duration: fmt_duration((now - state.first).max(0) as u64),
         listening: port_in_use(&key.proto, key.dport),
         nearby,
-        discovery: discovery::classify(&key.proto, state.sport, key.dport, nearby),
+        // Decided once, when the flow was first seen, and carried since.
+        discovery: state.discovery,
     }
 }
 
@@ -614,20 +680,35 @@ fn compose_discovery_alert(
         body.push_str(d);
         body.push('\n');
     }
-    let asked = match (&asker, facts.listening) {
-        (Some(comm), _) => format!("{comm} asked"),
-        // The socket is open but unattributable: another user owns it, or it
-        // closed between the two lookups.
-        (None, true) => "the asking socket is still open".to_string(),
-        // The reply outran its own query. Ordinary for a discovery round that
-        // finished before the last answer arrived.
-        (None, false) => "the asking socket has already closed".to_string(),
-    };
-    body.push_str(&format!(
-        "Answering this host's own {protocol} discovery — {asked}, and the firewall dropped \
-         the reply. {} drops over {} on {}. Discovery is broken here, not an intrusion.",
-        facts.total, facts.duration, facts.iface,
-    ));
+    // A socket bound to the port being answered is the only evidence available
+    // that this host actually asked. Source ports are chosen by the sender, so
+    // without it the shape of a reply is a claim the sender made about itself.
+    if facts.listening {
+        let asked = match &asker {
+            Some(comm) => format!("{comm} asked"),
+            // Bound but unattributable: another user owns it, or it closed
+            // between the two lookups.
+            None => "the asking socket is still open".to_string(),
+        };
+        body.push_str(&format!(
+            "Answering this host's own {protocol} discovery — {asked}, and the firewall dropped \
+             the reply. {} drops over {} on {}. Discovery is broken here, not an intrusion.",
+            facts.total, facts.duration, facts.iface,
+        ));
+    } else {
+        body.push_str(&format!(
+            "Shaped like an answer to this host's own {protocol} discovery, but nothing is bound \
+             to {}/{} to have asked — a peer can send from {}/{} without being asked anything. \
+             {} drops over {} on {}.",
+            facts.proto_lower,
+            facts.dport,
+            facts.proto_lower,
+            facts.sport,
+            facts.total,
+            facts.duration,
+            facts.iface,
+        ));
+    }
 
     let mut detail = format!(
         "{} logged. The query went out to a multicast group and the answer came back unicast \
@@ -641,9 +722,16 @@ fn compose_discovery_alert(
     detail.push_str(
         ", so conntrack has no entry to match it against and a default-deny input chain drops \
          it. To make discovery work, allow inbound udp from the local subnet; to make it stop, \
-         turn discovery off in the program that asks. Neither is urgent: nothing is being sent \
-         at this host that it did not ask for.",
+         turn discovery off in the program that asks.",
     );
+    if !facts.listening {
+        detail.push_str(
+            " Reported at full urgency because it could not be corroborated: a source port is \
+             chosen by the sender, so with no local socket bound there is nothing to distinguish \
+             a late reply from a peer that simply sent from that port. `discovery_replies = \
+             ignore` silences these too, at the cost of that distinction.",
+        );
+    }
     let source = if resolve {
         describe_source(&facts.src, facts.nearby)
     } else {
@@ -658,14 +746,29 @@ fn compose_discovery_alert(
         // made each round a brand-new subject, which is how one broken
         // discovery loop produced a stack of popups instead of one.
         key: format!("discovery-{}-{}", facts.src, protocol),
-        title: format!("{who} — {protocol} reply dropped"),
+        title: if facts.listening {
+            format!("{who} — {protocol} reply dropped")
+        } else {
+            format!("{who} — unsolicited {protocol} reply dropped")
+        },
         body,
         detail,
-        // A standing configuration fact, correctly explained, about traffic
-        // this host solicited. It is worth recording every time and worth
+        // Corroborated, this is a standing configuration fact about traffic
+        // this host solicited: worth recording every time and worth
         // interrupting for approximately never.
-        urgency: "low",
-        popup: cfg.discovery_replies == DiscoveryReplies::Alert,
+        //
+        // Uncorroborated, it is only the sender's word that this answers
+        // anything. A dismissal nothing could substantiate does not earn
+        // silence any more than an accusation nothing could substantiate earns
+        // a critical popup — the same rule `asymmetric-inbound` applies to
+        // itself, pointed the other way. `ignore` is how somebody opts out of
+        // the distinction on purpose.
+        urgency: if facts.listening { "low" } else { "normal" },
+        popup: if facts.listening {
+            cfg.discovery_replies == DiscoveryReplies::Alert
+        } else {
+            true
+        },
     }
 }
 
@@ -787,9 +890,23 @@ mod tests {
     /// M-SEARCH that this host multicast. Unicast from a neighbour, addressed
     /// to this host, sustained — indistinguishable from SAMPLE except that the
     /// source port says it is a reply.
-    const SSDP_REPLY: &str = "2026-08-28T00:42:04-07:00 ithilien kernel: [UFW BLOCK] IN=wlp1s0 \
-        OUT= MAC=3c:3b:ad:16:b7:30:a8:b5:7c:53:b2:fe:08:00 SRC=10.3.193.195 DST=10.3.153.246 \
-        LEN=328 TOS=0x00 PREC=0x00 TTL=64 ID=46308 DF PROTO=UDP SPT=1900 DPT=43285 LEN=308";
+    ///
+    /// Parameterised by destination port because corroboration now depends on
+    /// whether a socket is bound to it, and a test that hard-coded a port would
+    /// pass or fail on whatever the host running it happens to have open.
+    fn ssdp_reply(dport: u16) -> String {
+        format!(
+            "2026-08-28T00:42:04-07:00 ithilien kernel: [UFW BLOCK] IN=wlp1s0 OUT= \
+             MAC=3c:3b:ad:16:b7:30:a8:b5:7c:53:b2:fe:08:00 SRC=10.3.193.195 \
+             DST=10.3.153.246 LEN=328 TOS=0x00 PREC=0x00 TTL=64 ID=46308 DF PROTO=UDP \
+             SPT=1900 DPT={dport} LEN=308"
+        )
+    }
+
+    /// A port above the kernel's ephemeral allocation range (32768–60999 by
+    /// default): high enough to classify as a query source, and outside what
+    /// anything on the machine will have been handed automatically.
+    const NEVER_BOUND: u16 = 61999;
 
     /// Feed a record in often enough and long enough to clear both thresholds.
     fn sustain(tracker: &mut FlowTracker, cfg: &Config, record: &str, base: i64) -> Vec<Alert> {
@@ -799,6 +916,19 @@ mod tests {
             tracker.record(event, cfg);
         }
         tracker.tick_at(cfg, base + 200)
+    }
+
+    /// Capture what a flow logs when it ends, by running the tracker past the
+    /// window and reading back the classification it signed off with.
+    fn ended_as_discovery(tracker: &FlowTracker, src: &str, dport: u16) -> Option<&'static str> {
+        tracker
+            .flows
+            .get(&FlowKey {
+                src: src.to_string(),
+                proto: "UDP".to_string(),
+                dport,
+            })
+            .and_then(|state| state.alerted_as_discovery)
     }
 
     /// A tracker that believes it owns this machine's addresses, so tests never
@@ -913,15 +1043,23 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_to_our_own_discovery_is_reported_but_never_pops_up() {
+    fn a_corroborated_reply_to_our_own_discovery_never_pops_up() {
+        use std::net::UdpSocket;
+
+        // Hold the socket open for the duration: it is the evidence that this
+        // host asked, and dropping it would change the classification.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = socket.local_addr().expect("local addr").port();
+
         let cfg = Config::default();
         let mut tracker = tracker();
-        let alerts = sustain(&mut tracker, &cfg, SSDP_REPLY, 1_787_000_000);
+        let alerts = sustain(&mut tracker, &cfg, &ssdp_reply(port), 1_787_000_000);
 
         assert_eq!(alerts.len(), 1, "the flow is still reported");
         let a = &alerts[0];
         assert_eq!(a.kind, "discovery-reply", "not a flood, and must not say so");
-        assert!(!a.popup, "quiet is the default: journal only");
+        assert!(!a.popup, "quiet is the default when corroborated: journal only");
+        assert_eq!(a.urgency, "low");
         assert!(a.body.contains("SSDP"), "the protocol has to be named: {}", a.body);
         assert!(
             !a.body.contains("Nothing is listening"),
@@ -934,31 +1072,109 @@ mod tests {
     }
 
     #[test]
+    fn an_uncorroborated_reply_is_explained_but_still_interrupts() {
+        // Nothing is bound to the port being "answered", so only the sender's
+        // choice of source port says this replies to anything. A peer on the
+        // LAN can make that claim without this host having asked, so it keeps
+        // its popup — the finding is explained, not dismissed.
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let alerts = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), 1_787_000_000);
+
+        assert_eq!(alerts.len(), 1);
+        let a = &alerts[0];
+        assert_eq!(a.kind, "discovery-reply");
+        assert!(a.popup, "an uncorroborated dismissal does not earn silence");
+        assert_eq!(a.urgency, "normal");
+        assert!(
+            a.title.contains("unsolicited"),
+            "the title must not claim we asked: {}",
+            a.title
+        );
+    }
+
+    #[test]
     fn discovery_replies_can_be_asked_for_or_filtered_outright() {
+        use std::net::UdpSocket;
         let base = 1_787_000_000;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = socket.local_addr().expect("local addr").port();
 
         let alert_cfg = Config {
             discovery_replies: DiscoveryReplies::Alert,
             ..Config::default()
         };
         let mut asked_for = tracker();
-        let alerts = sustain(&mut asked_for, &alert_cfg, SSDP_REPLY, base);
+        let alerts = sustain(&mut asked_for, &alert_cfg, &ssdp_reply(port), base);
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].popup, "`alert` opts back in to the popup");
         assert_eq!(alerts[0].urgency, "low", "explained and benign, even when shown");
 
+        // `ignore` filters at intake, so it does not depend on corroboration.
         let ignore_cfg = Config {
             discovery_replies: DiscoveryReplies::Ignore,
             ..Config::default()
         };
         let mut filtered = tracker();
         for i in 0..6 {
-            let mut event = parse_line(SSDP_REPLY).expect("should parse");
+            let mut event = parse_line(&ssdp_reply(NEVER_BOUND)).expect("should parse");
             event.ts = base + i * 40;
             assert!(!filtered.record(event, &ignore_cfg), "must not reach the tracker");
         }
         assert!(filtered.tick_at(&ignore_cfg, base + 200).is_empty());
         assert_eq!(filtered.skipped().discovery_reply, 6);
+    }
+
+    #[test]
+    fn a_new_round_on_a_new_port_is_held_by_the_cooldown() {
+        // The bug this guards: every discovery round asks from a fresh
+        // ephemeral port, so every round was a new FlowKey carrying
+        // `alerted_at: None` and cleared the per-flow cooldown. Two rounds on
+        // two ports, well inside the cooldown, must produce one alert.
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let base = 1_787_000_000;
+
+        let first = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), base);
+        assert_eq!(first.len(), 1, "the first round is reported");
+
+        let second = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND - 1), base + 300);
+        assert!(
+            second.is_empty(),
+            "a second round inside the cooldown must not alert again: {:?}",
+            second.iter().map(|a| &a.title).collect::<Vec<_>>()
+        );
+
+        // Past the cooldown the subject is allowed to speak up again.
+        let later = base + cfg.cooldown_secs as i64 + 1000;
+        let third = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND - 2), later);
+        assert_eq!(third.len(), 1, "past the cooldown it reports again");
+    }
+
+    #[test]
+    fn a_flow_signs_off_the_way_it_was_announced() {
+        // The bug this guards: the cleanup path logged `blocked-flow-ended`
+        // for every flow, so a discovery round that had explained itself on
+        // the way in was reported as a blocked flow on the way out.
+        let cfg = Config::default();
+        let base = 1_787_000_000;
+
+        let mut discovery_flow = tracker();
+        sustain(&mut discovery_flow, &cfg, &ssdp_reply(NEVER_BOUND), base);
+        assert_eq!(
+            ended_as_discovery(&discovery_flow, "10.3.193.195", NEVER_BOUND),
+            Some("SSDP"),
+            "a reported discovery flow must remember that is what it was"
+        );
+
+        let mut flood = tracker();
+        sustain(&mut flood, &cfg, SAMPLE, base);
+        assert_eq!(
+            ended_as_discovery(&flood, "10.3.59.7", 37366),
+            None,
+            "a flood must not sign off as discovery"
+        );
     }
 
     #[test]

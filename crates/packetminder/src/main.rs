@@ -292,6 +292,18 @@ fn replay(cfg: Config, since: &str) {
         println!("{skipped}\n");
     }
 
+    // Corroborating a discovery reply means asking whether a socket is bound to
+    // the port it answered, and only today's socket table can be asked. Live,
+    // that question is put while the asking program still holds the socket;
+    // here it is put days later, when it does not. Replay therefore reports
+    // more "unsolicited" replies than the daemon ever would.
+    if alerts.iter().any(|(_, a)| a.kind == "discovery-reply") {
+        println!(
+            "Note: discovery replies are corroborated against the socket table as it is *now*, \
+             so historical rounds read as unsolicited more often than they did at the time.\n"
+        );
+    }
+
     if alerts.is_empty() {
         println!("Nothing would have alerted.");
         return;

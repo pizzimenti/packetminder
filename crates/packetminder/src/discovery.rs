@@ -27,7 +27,7 @@
 // broken, and it is never the one the address points at.
 // =============================================================================
 
-use std::{collections::HashSet, fs};
+use std::{collections::HashSet, fs, sync::OnceLock};
 
 // -- The Port Table -----------------------------------------------------------
 
@@ -50,11 +50,28 @@ const DISCOVERY_PORTS: &[(u16, &str)] = &[
     (57621, "Spotify Connect discovery"),
 ];
 
-/// Below this, a destination port is a service somebody chose to run, not an
-/// ephemeral source port a query went out from. Traffic aimed at a privileged
-/// port is judged as traffic aimed at a privileged port, whatever it claims to
-/// be answering.
-const EPHEMERAL_FLOOR: u16 = 1024;
+/// Linux's usual ephemeral range floor, for when /proc cannot be read.
+const DEFAULT_EPHEMERAL_FLOOR: u16 = 32768;
+
+/// The lowest port the kernel actually allocates ephemeral source ports from.
+///
+/// A query this host sent went out from *this* range, so a reply arriving
+/// anywhere else was not answering it. An earlier version accepted any
+/// unprivileged port, which was far too generous: it treated every port above
+/// 1024 as "somewhere a query might have come from", including the thousands of
+/// ports that services listen on.
+///
+/// Read once. The range is a boot-time tunable in practice, and re-reading it
+/// per packet would buy nothing.
+fn ephemeral_floor() -> u16 {
+    static FLOOR: OnceLock<u16> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|text| text.split_whitespace().next()?.parse().ok())
+            .unwrap_or(DEFAULT_EPHEMERAL_FLOOR)
+    })
+}
 
 // -- Classification -----------------------------------------------------------
 
@@ -66,13 +83,28 @@ const EPHEMERAL_FLOOR: u16 = 1024;
 ///   source ports is something else wearing the number.
 /// - **On-link or private source.** Discovery does not cross a router. A reply
 ///   from the internet is not a reply to anything this host multicast.
-/// - **Ephemeral destination.** The query's source port is where the answer
-///   lands. A flood *at* udp/1900 is a flood, and must stay visible.
+/// - **Destination inside the kernel's ephemeral range.** The query's source
+///   port is where the answer lands, and the kernel draws those from one
+///   specific range. A flood *at* udp/1900 is a flood, and must stay visible.
 /// - **Destination is not itself a discovery port.** Otherwise the announcement
 ///   traffic these protocols send between their own well-known ports would be
 ///   swallowed by the rule meant for their replies.
+///
+/// # What this cannot prove
+///
+/// A source port is chosen by the sender, so this is evidence, not proof. A
+/// peer already on the LAN can send from udp/1900 into the ephemeral range
+/// without this host ever having asked anything, and it will match here.
+///
+/// That is why matching alone does not silence anything: the caller pairs this
+/// with whether a local socket is actually bound to the destination port, and
+/// only that combination — a shape consistent with a reply *and* a socket that
+/// would have received one — is quiet by default. See `compose_discovery_alert`.
+/// The volume-sensitive detectors (`asymmetric-inbound`, `udp-no-listener`) read
+/// interface and kernel counters rather than this log, and are unaffected by
+/// anything decided here.
 pub fn classify(proto: &str, sport: u16, dport: u16, nearby: bool) -> Option<&'static str> {
-    if !proto.eq_ignore_ascii_case("UDP") || !nearby || dport < EPHEMERAL_FLOOR {
+    if !proto.eq_ignore_ascii_case("UDP") || !nearby || dport < ephemeral_floor() {
         return None;
     }
     if named_port(dport).is_some() {
@@ -213,6 +245,25 @@ mod tests {
         assert_eq!(classify("UDP", 1900, 1900, true), None);
         assert_eq!(classify("UDP", 5353, 5353, true), None);
         assert_eq!(classify("UDP", 1900, 500, true), None);
+    }
+
+    #[test]
+    fn only_the_kernels_own_ephemeral_range_counts_as_a_query_source() {
+        // Unprivileged but not ephemeral: no query this host sent could have
+        // gone out from here, so a "reply" arriving here is answering nobody.
+        // These are the ports an unlisted service is most likely to occupy.
+        for dport in [1024, 3000, 8080, 8443, 25565] {
+            assert_eq!(
+                classify("UDP", 1900, dport, true),
+                None,
+                "udp/{dport} is below the ephemeral range and must stay visible"
+            );
+        }
+        assert!(
+            ephemeral_floor() >= DEFAULT_EPHEMERAL_FLOOR || ephemeral_floor() >= 1024,
+            "a parsed range must still be a plausible ephemeral floor"
+        );
+        assert_eq!(classify("UDP", 1900, 43285, true), Some("SSDP"));
     }
 
     #[test]
