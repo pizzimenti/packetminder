@@ -456,6 +456,16 @@ impl FlowTracker {
             state.alerted_at = None;
             state.announced = false;
             state.alerted_as_discovery = None;
+            // From scratch means the window too. The history under the old
+            // classification was reply traffic; letting it count toward the
+            // new flow's sustained threshold would turn one stray packet on a
+            // reused port into an instant critical popup, with the innocent
+            // replies as its evidence. The blocked flow this now is earns its
+            // report with its own traffic.
+            state.times.clear();
+            state.total = 0;
+            state.bytes = 0;
+            state.first = event.ts;
         }
 
         if !state.dsts.contains(&event.dst) {
@@ -1460,6 +1470,31 @@ mod tests {
             "a flow that cannot name its one source port is not a reply stream"
         );
         assert!(alerts[0].popup, "and it stays loud even with a socket bound");
+    }
+
+    #[test]
+    fn one_stray_packet_after_a_reply_round_is_not_a_flood() {
+        // The other direction revocation can go wrong: a legitimate sustained
+        // reply round, then a single packet from a different source port —
+        // the ephemeral destination reused by something else. If the old
+        // window survived revocation, that one packet would inherit an
+        // already-sustained history and fire a critical popup with the
+        // innocent replies as its evidence.
+        let [port] = unbound_ports();
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let base = 1_787_000_000;
+
+        sustain(&mut tracker, &cfg, &ssdp_reply(port), base);
+
+        let mut stray = parse_line(&reply_from(40000, port)).expect("should parse");
+        stray.ts = base + 300;
+        tracker.record(stray, &cfg);
+
+        assert!(
+            tracker.tick_at(&cfg, base + 320).is_empty(),
+            "one post-revocation packet has not earned a report"
+        );
     }
 
     #[test]
