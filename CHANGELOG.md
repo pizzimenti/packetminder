@@ -4,7 +4,7 @@ All notable changes to packetminder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0] — 2026-08-30
 
 ### Added
 
