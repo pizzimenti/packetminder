@@ -196,6 +196,15 @@ accusation nothing could substantiate earns a critical popup — the same rule
 `asymmetric-inbound` applies to itself, pointed the other way. `ignore` is how
 you opt out of the distinction deliberately.
 
+The socket check honours what `/proc/net` exposes: the bound address and its
+family (with `IPV6_V6ONLY` invisible, a bare `[::]` claims nothing across
+families, while a v4-mapped binding is provably v4-capable), and the remote
+half of the tuple — a connected UDP socket corroborates only the flow whose
+sender it is connected to. What `/proc/net` does not expose cannot be honoured:
+`SO_BINDTODEVICE` is the known gap, where a socket tied to one interface
+corroborates traffic that arrived on another. Discovery clients do not bind
+devices in practice, and every other unknown fails toward the popup.
+
 Two things bound the residual risk. The volume-sensitive detectors
 (`asymmetric-inbound` from interface counters, `udp-no-listener` from
 `Udp.NoPorts`) never consult the drop log's source port, so nothing decided here
