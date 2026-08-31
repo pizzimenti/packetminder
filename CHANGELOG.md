@@ -37,8 +37,15 @@ All notable changes to packetminder are documented here. The format follows
   itself on the way in was reported as a blocked flow on the way out.
 - The destination must fall inside the kernel's own ephemeral range
   (`/proc/sys/net/ipv4/ip_local_port_range`) rather than merely being
-  unprivileged. Accepting everything above 1024 treated the thousands of ports
-  services listen on as places a query might have come from.
+  unprivileged — and *inside* means both ends. Accepting everything above 1024
+  treated the thousands of ports services listen on as places a query might
+  have come from; honouring only the floor left every port above the ceiling —
+  where services bind precisely because the kernel will not hand those ports
+  out — wearing the same disguise.
+- Wildcard corroboration respects the address family: `0.0.0.0` and `[::]`
+  both answer `is_unspecified()`, but an IPv4 wildcard socket never receives an
+  IPv6 packet and no longer vouches for one. An IPv6 wildcard still covers
+  v4-mapped traffic on a dual-stack host.
 - **Shape alone no longer silences anything.** A source port is chosen by the
   sender, so a peer on the LAN can send from udp/1900 without this host having
   asked. Suppression now also requires a local socket bound to the port being

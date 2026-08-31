@@ -57,26 +57,34 @@ const DISCOVERY_PORTS: &[(u16, &str)] = &[
     (57621, "Spotify Connect discovery"),
 ];
 
-/// Linux's usual ephemeral range floor, for when /proc cannot be read.
-const DEFAULT_EPHEMERAL_FLOOR: u16 = 32768;
+/// Linux's usual ephemeral range, for when /proc cannot be read.
+const DEFAULT_EPHEMERAL_RANGE: (u16, u16) = (32768, 60999);
 
-/// The lowest port the kernel actually allocates ephemeral source ports from.
+/// The range the kernel actually allocates ephemeral source ports from.
 ///
-/// A query this host sent went out from *this* range, so a reply arriving
-/// anywhere else was not answering it. An earlier version accepted any
-/// unprivileged port, which was far too generous: it treated every port above
-/// 1024 as "somewhere a query might have come from", including the thousands of
-/// ports that services listen on.
+/// A query this host sent went out from *inside* this range, so a reply
+/// arriving anywhere else was not answering it. Both bounds matter. An earlier
+/// version accepted any unprivileged port, which treated the thousands of
+/// ports services listen on as places a query might have come from; the
+/// version after that read only the floor, which left every port above the
+/// kernel's ceiling — where services deliberately bind precisely because the
+/// kernel will not hand them out — wearing the same disguise.
 ///
 /// Read once. The range is a boot-time tunable in practice, and re-reading it
 /// per packet would buy nothing.
-fn ephemeral_floor() -> u16 {
-    static FLOOR: OnceLock<u16> = OnceLock::new();
-    *FLOOR.get_or_init(|| {
+fn ephemeral_range() -> (u16, u16) {
+    static RANGE: OnceLock<(u16, u16)> = OnceLock::new();
+    *RANGE.get_or_init(|| {
         fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
             .ok()
-            .and_then(|text| text.split_whitespace().next()?.parse().ok())
-            .unwrap_or(DEFAULT_EPHEMERAL_FLOOR)
+            .and_then(|text| {
+                let mut fields = text.split_whitespace();
+                let floor: u16 = fields.next()?.parse().ok()?;
+                let ceiling: u16 = fields.next()?.parse().ok()?;
+                // A backwards range is not a range; take the default over garbage.
+                (floor <= ceiling).then_some((floor, ceiling))
+            })
+            .unwrap_or(DEFAULT_EPHEMERAL_RANGE)
     })
 }
 
@@ -90,9 +98,12 @@ fn ephemeral_floor() -> u16 {
 ///   source ports is something else wearing the number.
 /// - **On-link or private source.** Discovery does not cross a router. A reply
 ///   from the internet is not a reply to anything this host multicast.
-/// - **Destination inside the kernel's ephemeral range.** The query's source
-///   port is where the answer lands, and the kernel draws those from one
-///   specific range. A flood *at* udp/1900 is a flood, and must stay visible.
+/// - **Destination inside the kernel's ephemeral range — both ends of it.**
+///   The query's source port is where the answer lands, and the kernel draws
+///   those from one specific range. Below it live the ports services choose;
+///   above its ceiling live the ports services choose *because* the kernel
+///   will not hand them out. A flood at either is a flood, and must stay
+///   visible.
 /// - **Destination is not itself a discovery port.** Otherwise the announcement
 ///   traffic these protocols send between their own well-known ports would be
 ///   swallowed by the rule meant for their replies.
@@ -111,7 +122,8 @@ fn ephemeral_floor() -> u16 {
 /// interface and kernel counters rather than this log, and are unaffected by
 /// anything decided here.
 pub fn classify(proto: &str, sport: u16, dport: u16, nearby: bool) -> Option<&'static str> {
-    if !proto.eq_ignore_ascii_case("UDP") || !nearby || dport < ephemeral_floor() {
+    let (floor, ceiling) = ephemeral_range();
+    if !proto.eq_ignore_ascii_case("UDP") || !nearby || dport < floor || dport > ceiling {
         return None;
     }
     if named_port(dport).is_some() {
@@ -320,21 +332,41 @@ mod tests {
 
     #[test]
     fn only_the_kernels_own_ephemeral_range_counts_as_a_query_source() {
+        let (floor, ceiling) = ephemeral_range();
+
         // Unprivileged but not ephemeral: no query this host sent could have
         // gone out from here, so a "reply" arriving here is answering nobody.
         // These are the ports an unlisted service is most likely to occupy.
         for dport in [1024, 3000, 8080, 8443, 25565] {
+            assert!(
+                dport < floor,
+                "test premise: udp/{dport} sits below the ephemeral range"
+            );
             assert_eq!(
                 classify("UDP", 1900, dport, true),
                 None,
                 "udp/{dport} is below the ephemeral range and must stay visible"
             );
         }
-        assert!(
-            ephemeral_floor() >= DEFAULT_EPHEMERAL_FLOOR || ephemeral_floor() >= 1024,
-            "a parsed range must still be a plausible ephemeral floor"
-        );
-        assert_eq!(classify("UDP", 1900, 43285, true), Some("SSDP"));
+
+        // The ceiling binds too. Services bind above it precisely because the
+        // kernel will not hand those ports out, so a "reply" landing there is
+        // aimed at a service, not at a query's return address.
+        if ceiling < u16::MAX {
+            assert_eq!(
+                classify("UDP", 1900, ceiling + 1, true),
+                None,
+                "udp/{} is above the ephemeral range and must stay visible",
+                ceiling + 1
+            );
+        }
+        // The interior of the real range classifies — stepping off any port
+        // that happens to be in the discovery table itself.
+        let mut inside = floor.midpoint(ceiling);
+        while named_port(inside).is_some() {
+            inside += 1;
+        }
+        assert_eq!(classify("UDP", 1900, inside, true), Some("SSDP"));
     }
 
     #[test]

@@ -972,10 +972,29 @@ mod tests {
         (socket, port)
     }
 
-    /// A port above the kernel's ephemeral allocation range (32768–60999 by
-    /// default): high enough to classify as a query source, and outside what
-    /// anything on the machine will have been handed automatically.
-    const NEVER_BOUND: u16 = 61999;
+    /// Distinct ports inside the kernel's real ephemeral range with nothing
+    /// bound to them — the shape of a reply whose querying socket has closed.
+    ///
+    /// Asking the kernel and releasing is the only honest source: the range is
+    /// host configuration, so a hard-coded number lands outside it somewhere.
+    /// Binding all `n` first guarantees distinctness; the check afterwards
+    /// catches the slim race of another process claiming one in between.
+    fn unbound_ports<const N: usize>() -> [u16; N] {
+        for _ in 0..16 {
+            let sockets: Vec<std::net::UdpSocket> = (0..N)
+                .map(|_| std::net::UdpSocket::bind("0.0.0.0:0").expect("bind"))
+                .collect();
+            let mut ports = [0u16; N];
+            for (slot, socket) in ports.iter_mut().zip(&sockets) {
+                *slot = socket.local_addr().expect("local addr").port();
+            }
+            drop(sockets);
+            if ports.iter().all(|&p| !port_in_use("UDP", p)) {
+                return ports;
+            }
+        }
+        panic!("could not find {N} unbound ephemeral ports");
+    }
 
     /// Feed a record in often enough and long enough to clear both thresholds.
     fn sustain(tracker: &mut FlowTracker, cfg: &Config, record: &str, base: i64) -> Vec<Alert> {
@@ -1143,9 +1162,10 @@ mod tests {
         // choice of source port says this replies to anything. A peer on the
         // LAN can make that claim without this host having asked, so it keeps
         // its popup — the finding is explained, not dismissed.
+        let [port] = unbound_ports();
         let cfg = Config::default();
         let mut tracker = tracker();
-        let alerts = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), 1_787_000_000);
+        let alerts = sustain(&mut tracker, &cfg, &ssdp_reply(port), 1_787_000_000);
 
         assert_eq!(alerts.len(), 1);
         let a = &alerts[0];
@@ -1179,9 +1199,10 @@ mod tests {
             discovery_replies: DiscoveryReplies::Ignore,
             ..Config::default()
         };
+        let [unbound] = unbound_ports();
         let mut filtered = tracker();
         for i in 0..6 {
-            let mut event = parse_line(&ssdp_reply(NEVER_BOUND)).expect("should parse");
+            let mut event = parse_line(&ssdp_reply(unbound)).expect("should parse");
             event.ts = base + i * 40;
             assert!(!filtered.record(event, &ignore_cfg), "must not reach the tracker");
         }
@@ -1195,14 +1216,15 @@ mod tests {
         // ephemeral port, so every round was a new FlowKey carrying
         // `alerted_at: None` and cleared the per-flow cooldown. Two rounds on
         // two ports, well inside the cooldown, must produce one alert.
+        let [round1, round2, round3] = unbound_ports();
         let cfg = Config::default();
         let mut tracker = tracker();
         let base = 1_787_000_000;
 
-        let first = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), base);
+        let first = sustain(&mut tracker, &cfg, &ssdp_reply(round1), base);
         assert_eq!(first.len(), 1, "the first round is reported");
 
-        let second = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND - 1), base + 300);
+        let second = sustain(&mut tracker, &cfg, &ssdp_reply(round2), base + 300);
         assert!(
             second.is_empty(),
             "a second round inside the cooldown must not alert again: {:?}",
@@ -1211,7 +1233,7 @@ mod tests {
 
         // Past the cooldown the subject is allowed to speak up again.
         let later = base + cfg.cooldown_secs as i64 + 1000;
-        let third = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND - 2), later);
+        let third = sustain(&mut tracker, &cfg, &ssdp_reply(round3), later);
         assert_eq!(third.len(), 1, "past the cooldown it reports again");
     }
 
@@ -1232,7 +1254,8 @@ mod tests {
 
         // Same source, same protocol, well inside the cooldown the quiet round
         // just started — but nothing is bound to this port.
-        let loud = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), base + 60);
+        let [unbound] = unbound_ports();
+        let loud = sustain(&mut tracker, &cfg, &ssdp_reply(unbound), base + 60);
         assert_eq!(loud.len(), 1, "the uncorroborated round must still be raised");
         assert!(loud[0].popup, "and must still interrupt");
         assert!(loud[0].title.contains("unsolicited"));
@@ -1243,12 +1266,13 @@ mod tests {
         // The suppression branch sets `alerted_at` for bookkeeping. If the
         // ended-log keyed on that, a round that was never announced would
         // announce that it had stopped.
+        let [round1, round2] = unbound_ports();
         let cfg = Config::default();
         let mut tracker = tracker();
         let base = 1_787_000_000;
 
-        sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND), base);
-        let second = sustain(&mut tracker, &cfg, &ssdp_reply(NEVER_BOUND - 1), base + 60);
+        sustain(&mut tracker, &cfg, &ssdp_reply(round1), base);
+        let second = sustain(&mut tracker, &cfg, &ssdp_reply(round2), base + 60);
         assert!(second.is_empty(), "second round inside the cooldown is suppressed");
 
         let suppressed = tracker
@@ -1256,7 +1280,7 @@ mod tests {
             .get(&FlowKey {
                 src: "10.3.193.195".to_string(),
                 proto: "UDP".to_string(),
-                dport: NEVER_BOUND - 1,
+                dport: round2,
             })
             .expect("the suppressed flow is still tracked");
         assert!(suppressed.alerted_at.is_some(), "bookkeeping still happened");
@@ -1305,10 +1329,11 @@ mod tests {
         let cfg = Config::default();
         let base = 1_787_000_000;
 
+        let [unbound] = unbound_ports();
         let mut discovery_flow = tracker();
-        sustain(&mut discovery_flow, &cfg, &ssdp_reply(NEVER_BOUND), base);
+        sustain(&mut discovery_flow, &cfg, &ssdp_reply(unbound), base);
         assert_eq!(
-            ended_as_discovery(&discovery_flow, "10.3.193.195", NEVER_BOUND),
+            ended_as_discovery(&discovery_flow, "10.3.193.195", unbound),
             Some("SSDP"),
             "a reported discovery flow must remember that is what it was"
         );
