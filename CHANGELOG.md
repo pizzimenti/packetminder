@@ -51,6 +51,11 @@ All notable changes to packetminder are documented here. The format follows
   latest packet's. On a multi-homed host one flow lands on several addresses,
   and a socket bound to the last one must not vouch for packets aimed at the
   others; past eight distinct destinations corroboration is refused outright.
+- Revoking a flow's discovery classification resets its alert state. A flow
+  that opened reply-shaped and turned into a flood was reclassified correctly
+  but inherited the discovery report's cooldown, buying the flood half an hour
+  without a popup; it is now re-judged from scratch, with a `discovery-revoked`
+  journal line closing out the earlier report.
 - A connected UDP socket corroborates only the flow whose sender it is
   connected to. The kernel filters delivery on the remote half of the tuple,
   so the socket scan honours `rem_address` too — an unrelated connected socket

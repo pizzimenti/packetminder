@@ -433,8 +433,25 @@ impl FlowTracker {
         // it disqualifies the whole flow. A stream that is only sometimes
         // shaped like a reply is not a reply stream, and the source port it
         // arrived on is the sender's choice either way.
-        if state.discovery != classified {
+        if state.discovery != classified && state.discovery.is_some() {
+            // Everything said about this flow was said about a different
+            // thing, and the blocked flow it now is must be judged from
+            // scratch. Above all the alert timestamp: inheriting it would let
+            // a sender open with reply-shaped packets, take the quiet report,
+            // and then flood for a whole cooldown without a popup.
+            if state.announced {
+                alert::log(&format!(
+                    "discovery-revoked — {} → udp/{} stopped looking like {} replies; \
+                     re-judging as a blocked flow",
+                    device_label_cached(&event.src),
+                    event.dport,
+                    state.discovery.unwrap_or("discovery"),
+                ));
+            }
             state.discovery = None;
+            state.alerted_at = None;
+            state.announced = false;
+            state.alerted_as_discovery = None;
         }
 
         if !state.dsts.contains(&event.dst) {
@@ -1404,6 +1421,41 @@ mod tests {
             "a stream that is only sometimes reply-shaped is not a reply stream"
         );
         assert!(alerts[0].popup, "and it keeps its popup even with a socket bound");
+    }
+
+    #[test]
+    fn a_revoked_flow_does_not_inherit_the_discovery_cooldown() {
+        // The opening a sender could otherwise buy: fire reply-shaped packets
+        // until the discovery report stamps the flow's alert timestamp, then
+        // flood the same destination port. Sticky-off reclassifies the flow,
+        // but without a reset the per-flow cooldown would swallow the
+        // blocked-flow alert for half an hour.
+        let [port] = unbound_ports();
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let base = 1_787_000_000;
+
+        let opening = sustain(&mut tracker, &cfg, &ssdp_reply(port), base);
+        assert_eq!(opening.len(), 1);
+        assert_eq!(opening[0].kind, "discovery-reply", "the bait round is reported");
+
+        // The flood arrives on the same flow, well inside the cooldown the
+        // discovery report started.
+        let flood_start = base + 300;
+        for i in 0..6 {
+            let mut event = parse_line(&reply_from(40000, port)).expect("should parse");
+            event.ts = flood_start + i * 40;
+            tracker.record(event, &cfg);
+        }
+        let alerts = tracker.tick_at(&cfg, flood_start + 200);
+        assert_eq!(alerts.len(), 1, "the reclassified flood must alert immediately");
+        assert_eq!(alerts[0].kind, "blocked-flow");
+        assert!(alerts[0].popup, "and it interrupts — no inherited quiet");
+        assert_eq!(
+            ended_as_discovery(&tracker, "10.3.193.195", port),
+            None,
+            "and it will sign off as what it became, not what it opened as"
+        );
     }
 
     #[test]
