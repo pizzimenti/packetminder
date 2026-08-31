@@ -630,9 +630,14 @@ fn describe_source_at(ip: &str, nearby: bool, resolve: bool) -> String {
 /// True for RFC1918, CGNAT, link-local and loopback space.
 pub fn is_private(ip: &str) -> bool {
     let Ok(addr) = ip.parse::<Ipv4Addr>() else {
-        // Treat IPv6 ULA/link-local as private; anything else public.
+        // Treat IPv6 ULA/link-local as private; anything else public. ULA is
+        // fc00::/7 — both halves, even though RFC 4193 only ever assigns from
+        // fd00::/8 in practice.
         let lower = ip.to_lowercase();
-        return lower.starts_with("fd") || lower.starts_with("fe80") || lower == "::1";
+        return lower.starts_with("fc")
+            || lower.starts_with("fd")
+            || lower.starts_with("fe80")
+            || lower == "::1";
     };
     let [a, b, ..] = addr.octets();
     addr.is_private()

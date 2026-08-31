@@ -806,8 +806,10 @@ fn compose_discovery_alert(
         let asked = match &asker {
             Some(comm) => format!("{comm} asked"),
             // Bound but unattributable: another user owns it, or it closed
-            // between the two lookups.
-            None => "the asking socket is still open".to_string(),
+            // between the corroboration check and this lookup — enrichment
+            // runs after DNS and whois, which widens that gap. Say what was
+            // established, not what may no longer be true.
+            None => "the asking socket was open when checked".to_string(),
         };
         body.push_str(&format!(
             "Answering this host's own {protocol} discovery — {asked}, and the firewall dropped \
