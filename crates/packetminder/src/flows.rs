@@ -642,10 +642,9 @@ fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) ->
         // last packet must not vouch for the ones before it.
         corroborated: state.discovery.is_some()
             && !state.dst_overflow
-            && state
-                .dsts
-                .iter()
-                .all(|dst| discovery::solicited_locally(&key.proto, dst, key.dport)),
+            && state.dsts.iter().all(|dst| {
+                discovery::solicited_locally(&key.proto, &key.src, state.sport, dst, key.dport)
+            }),
         nearby,
         // Sticky-off across the flow's life, not re-decided here.
         discovery: state.discovery,
@@ -750,7 +749,7 @@ fn compose_discovery_alert(
     // and whois, so it lives on the same side of the bare/enriched split and
     // never runs on the detector loop.
     let asker = if resolve {
-        discovery::asker(&facts.proto_lower, &facts.dst, facts.dport)
+        discovery::asker(&facts.proto_lower, &facts.src, facts.sport, &facts.dst, facts.dport)
     } else {
         None
     };

@@ -151,9 +151,11 @@ fn named_port(port: u16) -> Option<&'static str> {
 /// socket bound to 127.0.0.1 as proof that a packet addressed to a LAN address
 /// had been solicited, which it cannot be: a loopback socket never receives LAN
 /// traffic. Only a wildcard binding, or one on the very address the packet was
-/// sent to, can have been listening for it.
-pub fn solicited_locally(proto: &str, dst: &str, port: u16) -> bool {
-    !matching_inodes(proto, dst, port).is_empty()
+/// sent to, can have been listening for it. The sender matters too: a
+/// connected UDP socket receives from its configured peer and nobody else, so
+/// it corroborates only the flow whose source it is connected to.
+pub fn solicited_locally(proto: &str, src: &str, sport: u16, dst: &str, port: u16) -> bool {
+    !matching_inodes(proto, src, sport, dst, port).is_empty()
 }
 
 /// The command holding the socket a reply was addressed to, when one still is.
@@ -172,8 +174,8 @@ pub fn solicited_locally(proto: &str, dst: &str, port: u16) -> bool {
 /// Under `--replay` this reads *today's* socket table against historical
 /// records, the same approximation the on-link test already makes. The journal
 /// does not record who held a port an hour ago, and `--replay` says so.
-pub fn asker(proto: &str, dst: &str, port: u16) -> Option<String> {
-    let inodes = matching_inodes(proto, dst, port);
+pub fn asker(proto: &str, src: &str, sport: u16, dst: &str, port: u16) -> Option<String> {
+    let inodes = matching_inodes(proto, src, sport, dst, port);
     if inodes.is_empty() {
         return None;
     }
@@ -183,13 +185,14 @@ pub fn asker(proto: &str, dst: &str, port: u16) -> Option<String> {
 /// Socket inodes bound to `port` on an address that could have received a
 /// packet sent to `dst`, formatted as the fd symlink target they will appear
 /// as: `socket:[12345]`.
-fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
+fn matching_inodes(proto: &str, src: &str, sport: u16, dst: &str, port: u16) -> HashSet<String> {
     let files: &[&str] = match proto.to_ascii_uppercase().as_str() {
         "UDP" => &["udp", "udp6"],
         "TCP" => &["tcp", "tcp6"],
         _ => return HashSet::new(),
     };
     let destination = parse_ip(dst);
+    let sender = parse_ip(src);
 
     let mut inodes = HashSet::new();
     for name in files {
@@ -198,9 +201,11 @@ fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
         };
         for line in text.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            // Column 1 is local_address as HEX_ADDR:HEX_PORT; column 9 is the
-            // socket inode.
-            let (Some(local), Some(inode)) = (fields.get(1), fields.get(9)) else {
+            // Column 1 is local_address, column 2 rem_address — both as
+            // HEX_ADDR:HEX_PORT — and column 9 the socket inode.
+            let (Some(local), Some(remote), Some(inode)) =
+                (fields.get(1), fields.get(2), fields.get(9))
+            else {
                 continue;
             };
             let Some((hex_addr, hex_port)) = local.rsplit_once(':') else {
@@ -212,7 +217,29 @@ fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
             let Some(bound) = parse_proc_addr(hex_addr) else {
                 continue;
             };
-            if could_receive(&bound, destination) {
+            if !could_receive(&bound, destination) {
+                continue;
+            }
+
+            // A connected UDP socket receives from its configured peer and
+            // nobody else — the kernel filters on the remote half of the
+            // tuple, so this scan has to as well. Anything else on a
+            // coincidental local port would vouch for traffic it can never be
+            // handed. Unconnected sockets take everyone; connected ones only
+            // corroborate the very sender this flow belongs to.
+            let Some((rem_hex, rem_port_hex)) = remote.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(rem_port) = u16::from_str_radix(rem_port_hex, 16) else {
+                continue;
+            };
+            let Some(rem_addr) = parse_proc_addr(rem_hex) else {
+                continue;
+            };
+            let unconnected = rem_port == 0 && rem_addr.is_unspecified();
+            let connected_to_sender =
+                rem_port == sport && sport != 0 && sender == Some(rem_addr);
+            if unconnected || connected_to_sender {
                 inodes.insert(format!("socket:[{inode}]"));
             }
         }
@@ -392,10 +419,10 @@ mod tests {
     fn attribution_is_free_when_no_socket_is_bound() {
         // Port 0 can never be bound, so this exercises the early return that
         // keeps the /proc walk off the common path.
-        assert!(matching_inodes("UDP", "10.3.153.246", 0).is_empty());
-        assert_eq!(asker("UDP", "10.3.153.246", 0), None);
+        assert!(matching_inodes("UDP", "10.3.193.195", 1900, "10.3.153.246", 0).is_empty());
+        assert_eq!(asker("UDP", "10.3.193.195", 1900, "10.3.153.246", 0), None);
         // A protocol with no /proc/net file cannot produce inodes either.
-        assert!(matching_inodes("ICMP", "10.3.153.246", 1900).is_empty());
+        assert!(matching_inodes("ICMP", "10.3.193.195", 1900, "10.3.153.246", 1900).is_empty());
     }
 
     #[test]
@@ -408,13 +435,13 @@ mod tests {
         let port = socket.local_addr().expect("local addr").port();
 
         assert!(
-            solicited_locally("UDP", "10.3.153.246", port),
+            solicited_locally("UDP", "10.3.193.195", 1900, "10.3.153.246", port),
             "a wildcard socket this process just bound must corroborate"
         );
         // Whatever the harness calls the test binary, it is us, and the point
         // is that the inode resolved to a live process at all.
         assert!(
-            asker("UDP", "10.3.153.246", port).is_some(),
+            asker("UDP", "10.3.193.195", 1900, "10.3.153.246", port).is_some(),
             "should name the holding process"
         );
     }
@@ -432,13 +459,38 @@ mod tests {
         let port = socket.local_addr().expect("local addr").port();
 
         assert!(
-            !solicited_locally("UDP", "10.3.153.246", port),
+            !solicited_locally("UDP", "10.3.193.195", 1900, "10.3.153.246", port),
             "a loopback binding must not corroborate LAN-addressed traffic"
         );
         // It does corroborate traffic actually addressed to loopback.
         assert!(
-            solicited_locally("UDP", "127.0.0.1", port),
+            solicited_locally("UDP", "10.3.193.195", 1900, "127.0.0.1", port),
             "the same socket does account for loopback-addressed traffic"
+        );
+    }
+
+    #[test]
+    fn a_connected_socket_corroborates_only_its_own_peer() {
+        use std::net::UdpSocket;
+
+        // connect() on UDP is purely local — no packet leaves — but it makes
+        // the kernel filter delivery to exactly that peer. A socket connected
+        // elsewhere can never receive this flow, so it must not vouch for it.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind loopback");
+        let port = socket.local_addr().expect("local addr").port();
+        socket.connect("127.0.0.2:1900").expect("connect");
+
+        assert!(
+            solicited_locally("UDP", "127.0.0.2", 1900, "127.0.0.1", port),
+            "connected to the flow's own sender: this is the querying socket itself"
+        );
+        assert!(
+            !solicited_locally("UDP", "127.0.0.3", 1900, "127.0.0.1", port),
+            "connected to a different peer: the kernel would never deliver this flow"
+        );
+        assert!(
+            !solicited_locally("UDP", "127.0.0.2", 5353, "127.0.0.1", port),
+            "connected to a different port on the same peer: still undeliverable"
         );
     }
 

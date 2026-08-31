@@ -51,6 +51,11 @@ All notable changes to packetminder are documented here. The format follows
   latest packet's. On a multi-homed host one flow lands on several addresses,
   and a socket bound to the last one must not vouch for packets aimed at the
   others; past eight distinct destinations corroboration is refused outright.
+- A connected UDP socket corroborates only the flow whose sender it is
+  connected to. The kernel filters delivery on the remote half of the tuple,
+  so the socket scan honours `rem_address` too — an unrelated connected socket
+  on a coincidental local port can never receive the flow and no longer
+  vouches for it.
 - **Shape alone no longer silences anything.** A source port is chosen by the
   sender, so a peer on the LAN can send from udp/1900 without this host having
   asked. Suppression now also requires a local socket bound to the port being
