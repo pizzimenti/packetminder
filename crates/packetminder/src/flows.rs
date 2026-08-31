@@ -110,10 +110,18 @@ struct FlowState {
     iface: String,
     sport: u16,
     bytes: u64,
-    /// Where the packets were addressed. Needed to ask whether a local socket
-    /// could actually have received them — a binding on one address is no
-    /// evidence about traffic sent to another.
-    dst: String,
+    /// Every distinct address this flow's packets were sent to, in arrival
+    /// order. `FlowKey` carries no destination, and on a multi-homed host —
+    /// this one included — a single flow genuinely lands on more than one
+    /// local address. Corroboration has to hold for all of them: a binding on
+    /// one address is no evidence about the packets sent to another, and
+    /// checking only the latest would let the last packet vouch for every
+    /// packet before it.
+    dsts: Vec<String>,
+    /// The flow used more destinations than any real multi-homed host has
+    /// addresses. Refuses corroboration wholesale rather than letting a sender
+    /// cycle destinations until the list stops being checked.
+    dst_overflow: bool,
     alerted_at: Option<i64>,
     /// The discovery protocol every record in this flow has answered on.
     ///
@@ -134,6 +142,11 @@ struct FlowState {
     /// flow.
     alerted_as_discovery: Option<&'static str>,
 }
+
+/// Distinct destination addresses a flow may accumulate before corroboration
+/// is refused outright. Real multi-homed hosts have a handful of addresses;
+/// a flow spraying more than this is not landing on one of them.
+const MAX_FLOW_DSTS: usize = 8;
 
 pub struct FlowTracker {
     flows: HashMap<FlowKey, FlowState>,
@@ -181,13 +194,14 @@ struct FlowFacts {
     iface: String,
     duration: String,
     listening: bool,
-    /// Where the packets were addressed, for asking which local sockets could
-    /// have received them.
+    /// Where the packets were most recently addressed — the address handed to
+    /// process attribution, which needs one concrete address to match against.
     dst: String,
-    /// A local socket is bound on an address that could actually have received
-    /// this traffic. Stronger than `listening`, which only asks whether the
-    /// port is occupied anywhere — a loopback binding occupies a port without
-    /// being able to receive a single LAN packet.
+    /// A local socket is bound such that it could have received *every* packet
+    /// in this flow, whichever local address each was sent to. Stronger than
+    /// `listening`, which only asks whether the port is occupied anywhere — a
+    /// loopback binding occupies a port without being able to receive a single
+    /// LAN packet.
     corroborated: bool,
     nearby: bool,
     /// Name of the discovery protocol this flow is answering, when the record
@@ -407,7 +421,8 @@ impl FlowTracker {
             iface: event.iface.clone(),
             sport: event.sport,
             bytes: 0,
-            dst: event.dst.clone(),
+            dsts: vec![event.dst.clone()],
+            dst_overflow: false,
             alerted_at: None,
             discovery: classified,
             announced: false,
@@ -422,13 +437,20 @@ impl FlowTracker {
             state.discovery = None;
         }
 
+        if !state.dsts.contains(&event.dst) {
+            if state.dsts.len() < MAX_FLOW_DSTS {
+                state.dsts.push(event.dst.clone());
+            } else {
+                state.dst_overflow = true;
+            }
+        }
+
         state.times.push_back(event.ts);
         state.total += 1;
         state.bytes += event.len;
         state.last = event.ts;
         state.iface = event.iface;
         state.sport = event.sport;
-        state.dst = event.dst;
         true
     }
 
@@ -612,11 +634,18 @@ fn gather_facts(key: &FlowKey, state: &FlowState, now: i64, local: &LocalNet) ->
         iface: state.iface.clone(),
         duration: fmt_duration((now - state.first).max(0) as u64),
         listening: port_in_use(&key.proto, key.dport),
-        dst: state.dst.clone(),
+        dst: state.dsts.last().cloned().unwrap_or_default(),
         // Only asked when it can change the answer. For a flow that is not
-        // discovery-shaped at all, the /proc/net read would be pure cost.
+        // discovery-shaped at all, the /proc/net reads would be pure cost.
+        // Every destination the flow touched has to be covered: on a
+        // multi-homed host one flow lands on several local addresses, and the
+        // last packet must not vouch for the ones before it.
         corroborated: state.discovery.is_some()
-            && discovery::solicited_locally(&key.proto, &state.dst, key.dport),
+            && !state.dst_overflow
+            && state
+                .dsts
+                .iter()
+                .all(|dst| discovery::solicited_locally(&key.proto, dst, key.dport)),
         nearby,
         // Sticky-off across the flow's life, not re-decided here.
         discovery: state.discovery,
@@ -949,7 +978,18 @@ mod tests {
     /// whether a socket is bound to it, and a test that hard-coded a port would
     /// pass or fail on whatever the host running it happens to have open.
     fn ssdp_reply(dport: u16) -> String {
-        reply_from(1900, dport)
+        ssdp_reply_to("10.3.153.246", dport)
+    }
+
+    /// The same reply aimed at a chosen local address, for the multi-homed
+    /// cases where the destination is the variable under test.
+    fn ssdp_reply_to(dst: &str, dport: u16) -> String {
+        format!(
+            "2026-08-28T00:42:04-07:00 ithilien kernel: [UFW BLOCK] IN=wlp1s0 OUT= \
+             MAC=3c:3b:ad:16:b7:30:a8:b5:7c:53:b2:fe:08:00 SRC=10.3.193.195 \
+             DST={dst} LEN=328 TOS=0x00 PREC=0x00 TTL=64 ID=46308 DF PROTO=UDP \
+             SPT=1900 DPT={dport} LEN=308"
+        )
     }
 
     /// The same record with an arbitrary source port, for the cases where the
@@ -1235,6 +1275,52 @@ mod tests {
         let later = base + cfg.cooldown_secs as i64 + 1000;
         let third = sustain(&mut tracker, &cfg, &ssdp_reply(round3), later);
         assert_eq!(third.len(), 1, "past the cooldown it reports again");
+    }
+
+    #[test]
+    fn corroboration_must_cover_every_address_the_flow_was_sent_to() {
+        use std::net::UdpSocket;
+
+        // A socket bound to one specific address, and a flow that lands on it
+        // AND on an address the socket cannot receive. FlowKey carries no
+        // destination, so both land in the same flow — and the covered half
+        // must not vouch for the uncovered half.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind loopback");
+        let port = socket.local_addr().expect("local addr").port();
+
+        let cfg = Config::default();
+        let mut split = tracker();
+        let base = 1_787_000_000;
+        for i in 0..6 {
+            let dst = if i % 2 == 0 { "127.0.0.1" } else { "10.3.153.246" };
+            let mut event = parse_line(&ssdp_reply_to(dst, port)).expect("should parse");
+            event.ts = base + i * 40;
+            split.record(event, &cfg);
+        }
+        let alerts = split.tick_at(&cfg, base + 200);
+        assert_eq!(alerts.len(), 1);
+        assert!(
+            alerts[0].popup,
+            "half-covered is uncorroborated: the last packet must not vouch for the rest"
+        );
+        assert!(alerts[0].title.contains("unsolicited"));
+
+        // The same split flow against a wildcard binding is fully covered.
+        drop(socket);
+        let (_wildcard, wide_port) = bound_socket();
+        let mut covered = tracker();
+        for i in 0..6 {
+            let dst = if i % 2 == 0 { "127.0.0.1" } else { "10.3.153.246" };
+            let mut event = parse_line(&ssdp_reply_to(dst, wide_port)).expect("should parse");
+            event.ts = base + i * 40;
+            covered.record(event, &cfg);
+        }
+        let alerts = covered.tick_at(&cfg, base + 200);
+        assert_eq!(alerts.len(), 1);
+        assert!(
+            !alerts[0].popup,
+            "a wildcard covers every local address, so the split flow is corroborated"
+        );
     }
 
     #[test]

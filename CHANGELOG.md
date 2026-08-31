@@ -42,10 +42,15 @@ All notable changes to packetminder are documented here. The format follows
   have come from; honouring only the floor left every port above the ceiling —
   where services bind precisely because the kernel will not hand those ports
   out — wearing the same disguise.
-- Wildcard corroboration respects the address family: `0.0.0.0` and `[::]`
-  both answer `is_unspecified()`, but an IPv4 wildcard socket never receives an
-  IPv6 packet and no longer vouches for one. An IPv6 wildcard still covers
-  v4-mapped traffic on a dual-stack host.
+- Wildcard corroboration stays inside its address family: `0.0.0.0` and `[::]`
+  both answer `is_unspecified()`, but an IPv4 wildcard never receives an IPv6
+  packet, and whether a `[::]` socket takes v4-mapped traffic depends on
+  `IPV6_V6ONLY`, which `/proc/net` does not show. An uncheckable claim is not
+  corroboration, so neither direction vouches across families.
+- Corroboration covers every local address the flow was sent to, not just the
+  latest packet's. On a multi-homed host one flow lands on several addresses,
+  and a socket bound to the last one must not vouch for packets aimed at the
+  others; past eight distinct destinations corroboration is refused outright.
 - **Shape alone no longer silences anything.** A source port is chosen by the
   sender, so a peer on the LAN can send from udp/1900 without this host having
   asked. Suppression now also requires a local socket bound to the port being

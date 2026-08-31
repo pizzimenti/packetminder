@@ -223,19 +223,21 @@ fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
 /// Whether a socket bound to `local` could have received a packet sent to
 /// `destination`.
 ///
-/// Wildcards are wildcards only within their reach: an IPv6 wildcard takes
-/// everything on a dual-stack host, v4-mapped traffic included, but an IPv4
-/// wildcard never sees a single IPv6 packet — `0.0.0.0` and `[::]` both answer
-/// `is_unspecified()`, and treating them alike would let a v4-only socket
-/// corroborate v6-addressed traffic it cannot receive. Otherwise the addresses
-/// have to be the same one. An unparseable destination corroborates nothing —
-/// the safe direction, since failing to corroborate only means the alert keeps
-/// its popup.
+/// A wildcard is a wildcard only within its own family. `0.0.0.0` and `[::]`
+/// both answer `is_unspecified()`, but an IPv4 wildcard never sees a single
+/// IPv6 packet — and the reverse, an IPv6 wildcard taking v4-mapped traffic,
+/// is true only when the socket is dual-stack, which `IPV6_V6ONLY` turns off
+/// per socket and `net.ipv6.bindv6only` per host, neither visibly in
+/// /proc/net. A claim that cannot be checked is not corroboration, so the
+/// cross-family match is refused outright: the rare dual-stack-only program
+/// costs a popup where quiet was deserved, which is the direction this
+/// detector is allowed to be wrong in. Otherwise the addresses have to be the
+/// same one, and an unparseable destination corroborates nothing.
 fn could_receive(local: &IpAddr, destination: Option<IpAddr>) -> bool {
     match (local, destination) {
         (_, None) => false,
-        (IpAddr::V6(bound), Some(_)) if bound.is_unspecified() => true,
         (IpAddr::V4(bound), Some(IpAddr::V4(_))) if bound.is_unspecified() => true,
+        (IpAddr::V6(bound), Some(IpAddr::V6(_))) if bound.is_unspecified() => true,
         (bound, Some(dst)) => *bound == dst,
     }
 }
@@ -439,8 +441,8 @@ mod tests {
         let v4_dst = parse_ip("10.3.153.246");
         let v6_dst = parse_ip("fe80:0000:0000:0000:b787:4f5d:1cbb:eb39");
 
-        // 0.0.0.0 and [::] both answer is_unspecified(), but only one of them
-        // can receive traffic from the other family.
+        // 0.0.0.0 and [::] both answer is_unspecified(), but neither reaches
+        // across families as far as anything in /proc/net can prove.
         assert!(could_receive(&v4_any, v4_dst));
         assert!(
             !could_receive(&v4_any, v6_dst),
@@ -448,8 +450,9 @@ mod tests {
         );
         assert!(could_receive(&v6_any, v6_dst));
         assert!(
-            could_receive(&v6_any, v4_dst),
-            "a dual-stack v6 wildcard receives v4-mapped traffic"
+            !could_receive(&v6_any, v4_dst),
+            "whether a [::] socket takes v4-mapped traffic depends on IPV6_V6ONLY, \
+             which /proc/net does not show — an uncheckable claim corroborates nothing"
         );
 
         // No wildcard corroborates a destination that did not parse.

@@ -179,9 +179,12 @@ being answered — the only evidence available that this host asked:
 | No such socket | `discovery-reply`, `normal`, titled *unsolicited* | **Yes** |
 
 "Where the packet was addressed" is the operative part: the socket has to be on
-the wildcard address or on the very address the packet was sent to. Matching the
-port alone would let a socket bound to `127.0.0.1` corroborate a packet sent to a
-LAN address, which it cannot have received.
+the wildcard address — within the same family, since `IPV6_V6ONLY` is invisible
+in `/proc/net` — or on the very address the packet was sent to. Matching the
+port alone would let a socket bound to `127.0.0.1` corroborate a packet sent to
+a LAN address, which it cannot have received. And on a multi-homed host, where
+one flow lands on several local addresses, every one of them has to be covered —
+the last packet does not vouch for the ones before it.
 
 Classification is also **sticky-off** across a flow's life. `FlowKey` is
 `{source, protocol, destination port}` with no source port, so one reply-shaped
