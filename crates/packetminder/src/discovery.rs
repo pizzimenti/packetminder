@@ -257,7 +257,17 @@ fn parse_proc_addr(hex: &str) -> Option<IpAddr> {
                 let raw = u32::from_str_radix(text, 16).ok()?;
                 octets[word * 4..word * 4 + 4].copy_from_slice(&raw.swap_bytes().to_be_bytes());
             }
-            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+            let addr = Ipv6Addr::from(octets);
+            // A dual-stack socket bound to a v4 address shows up here as
+            // v4-mapped. Unlike a bare [::], that binding is *provably*
+            // v4-capable — IPV6_V6ONLY refuses mapped bindings outright — so
+            // canonicalising it is a checkable claim, and leaving it V6 would
+            // fail the family comparison against the v4 packet it is
+            // legitimately waiting for.
+            Some(match addr.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(addr),
+            })
         }
         _ => None,
     }
@@ -478,6 +488,12 @@ mod tests {
         assert_eq!(
             parse_proc_addr("00000000000000000000000001000000"),
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        // A dual-stack socket bound to a v4 address appears v4-mapped, and is
+        // canonicalised to the v4 address it is provably able to receive on.
+        assert_eq!(
+            parse_proc_addr("0000000000000000FFFF0000F699030A"),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 3, 153, 246)))
         );
         assert_eq!(parse_proc_addr("nonsense"), None);
     }
