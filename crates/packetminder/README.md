@@ -211,6 +211,13 @@ Two things bound the residual risk. The volume-sensitive detectors
 can hide a flood from them. And `quiet` still writes every occurrence to the
 journal — it suppresses the interrupt, not the record.
 
+What corroboration deliberately does **not** try to be is a volume gate. ufw
+rate-limits its own logging to a few records a minute, so drop-log counts
+measure persistence, not volume — a gate built on them would be theatre. A
+corroborated flow below the asymmetry detector's floor (1 Mbps by default) that
+is actually hostile stays quiet for one cooldown; that band is accepted, named
+here, and bounded by the interface counters above it.
+
 The alert names the local process holding the querying socket, resolved through
 `/proc/net/udp` to `/proc/*/fd`. That matters more than the device does. The
 device in the title is the innocent party — it answered a question — while the

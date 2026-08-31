@@ -375,12 +375,13 @@ mod tests {
 
         // Unprivileged but not ephemeral: no query this host sent could have
         // gone out from here, so a "reply" arriving here is answering nobody.
-        // These are the ports an unlisted service is most likely to occupy.
-        for dport in [1024, 3000, 8080, 8443, 25565] {
-            assert!(
-                dport < floor,
-                "test premise: udp/{dport} sits below the ephemeral range"
-            );
+        // These are the ports an unlisted service is most likely to occupy —
+        // filtered against the host's real floor, since a container configured
+        // with `1024 65535` legitimately swallows some of them into the range.
+        for dport in [1024u16, 3000, 8080, 8443, 25565]
+            .into_iter()
+            .filter(|&d| d < floor)
+        {
             assert_eq!(
                 classify("UDP", 1900, dport, true),
                 None,

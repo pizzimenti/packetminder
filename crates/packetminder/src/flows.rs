@@ -429,11 +429,15 @@ impl FlowTracker {
             alerted_as_discovery: None,
         });
 
-        // Any record that does not answer the same protocol as the ones before
-        // it disqualifies the whole flow. A stream that is only sometimes
-        // shaped like a reply is not a reply stream, and the source port it
-        // arrived on is the sender's choice either way.
-        if state.discovery != classified && state.discovery.is_some() {
+        // Any record that does not answer from the same place as the ones
+        // before it disqualifies the whole flow. A stream that is only
+        // sometimes shaped like a reply is not a reply stream — and the check
+        // is on the port, not just the protocol label, because Plex answers
+        // from two ports that share one label, and a connected socket is only
+        // ever checked against the flow's single source port.
+        if state.discovery.is_some()
+            && (state.discovery != classified || event.sport != state.sport)
+        {
             // Everything said about this flow was said about a different
             // thing, and the blocked flow it now is must be judged from
             // scratch. Above all the alert timestamp: inheriting it would let
@@ -531,6 +535,14 @@ impl FlowTracker {
                 continue;
             }
 
+            // Deliberately not re-corroborated while cooled: the querying
+            // socket closing under a still-arriving flow is the normal end of
+            // every discovery round, and treating that as a new, louder
+            // subject would re-raise a popup per round — the noise this
+            // detector exists to end. The judgment made at alert time stands
+            // for one cooldown; re-evaluation at expiry sees the socket gone,
+            // and volume in the meantime belongs to the interface-counter
+            // detectors, which no classification here can blind.
             let cooled = state
                 .alerted_at
                 .is_none_or(|last| now - last >= cfg.cooldown_secs as i64);
@@ -1421,6 +1433,33 @@ mod tests {
             "a stream that is only sometimes reply-shaped is not a reply stream"
         );
         assert!(alerts[0].popup, "and it keeps its popup even with a socket bound");
+    }
+
+    #[test]
+    fn answering_from_two_ports_of_one_protocol_is_still_a_revocation() {
+        // Plex GDM answers from 32412 and 32414, which share a label. A flow
+        // alternating between them keeps one classification while state.sport
+        // holds only the latest port — and a connected socket is checked
+        // against that one port alone. Same source-port discipline as any
+        // other flow: a change revokes.
+        let (_socket, port) = bound_socket();
+        let cfg = Config::default();
+        let mut tracker = tracker();
+        let base = 1_787_000_000;
+
+        for i in 0..6 {
+            let sport = if i % 2 == 0 { 32412 } else { 32414 };
+            let mut event = parse_line(&reply_from(sport, port)).expect("should parse");
+            event.ts = base + i * 40;
+            tracker.record(event, &cfg);
+        }
+        let alerts = tracker.tick_at(&cfg, base + 200);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            alerts[0].kind, "blocked-flow",
+            "a flow that cannot name its one source port is not a reply stream"
+        );
+        assert!(alerts[0].popup, "and it stays loud even with a socket bound");
     }
 
     #[test]
