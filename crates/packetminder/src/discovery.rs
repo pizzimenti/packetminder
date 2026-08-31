@@ -27,7 +27,14 @@
 // broken, and it is never the one the address points at.
 // =============================================================================
 
-use std::{collections::HashSet, fs, sync::OnceLock};
+use std::{
+    collections::HashSet,
+    fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::OnceLock,
+};
+
+use crate::local::parse_ip;
 
 // -- The Port Table -----------------------------------------------------------
 
@@ -122,6 +129,21 @@ fn named_port(port: u16) -> Option<&'static str> {
 
 // -- Local Attribution --------------------------------------------------------
 
+/// Whether a socket that could actually have received this packet is bound.
+///
+/// This is the corroboration the classifier cannot supply on its own. A source
+/// port proves nothing — the sender picked it — but a local socket bound where
+/// the packet was addressed is real evidence that something here asked.
+///
+/// The address half is load-bearing. Matching on the port alone counted a
+/// socket bound to 127.0.0.1 as proof that a packet addressed to a LAN address
+/// had been solicited, which it cannot be: a loopback socket never receives LAN
+/// traffic. Only a wildcard binding, or one on the very address the packet was
+/// sent to, can have been listening for it.
+pub fn solicited_locally(proto: &str, dst: &str, port: u16) -> bool {
+    !matching_inodes(proto, dst, port).is_empty()
+}
+
 /// The command holding the socket a reply was addressed to, when one still is.
 ///
 /// Two lookups: the port's socket inodes from /proc/net, then whichever process
@@ -130,30 +152,32 @@ fn named_port(port: u16) -> Option<&'static str> {
 /// since it is a desktop program doing desktop discovery. Other users' fd
 /// directories deny us and are skipped rather than guessed at.
 ///
-/// Returns None the moment no socket is bound, which is both correct and the
+/// Returns None the moment no socket matches, which is both correct and the
 /// reason this is affordable: a reply that outlived its querying socket — the
 /// common case for a discovery round that finished — costs two small reads and
 /// never walks /proc at all.
 ///
 /// Under `--replay` this reads *today's* socket table against historical
-/// records, the same approximation `port_in_use` and the on-link test already
-/// make. The journal does not record who held a port an hour ago.
-pub fn asker(proto: &str, port: u16) -> Option<String> {
-    let inodes = socket_inodes(proto, port);
+/// records, the same approximation the on-link test already makes. The journal
+/// does not record who held a port an hour ago, and `--replay` says so.
+pub fn asker(proto: &str, dst: &str, port: u16) -> Option<String> {
+    let inodes = matching_inodes(proto, dst, port);
     if inodes.is_empty() {
         return None;
     }
     process_holding(&inodes)
 }
 
-/// Socket inodes bound to `port`, formatted as the fd symlink target they will
-/// appear as: `socket:[12345]`.
-fn socket_inodes(proto: &str, port: u16) -> HashSet<String> {
+/// Socket inodes bound to `port` on an address that could have received a
+/// packet sent to `dst`, formatted as the fd symlink target they will appear
+/// as: `socket:[12345]`.
+fn matching_inodes(proto: &str, dst: &str, port: u16) -> HashSet<String> {
     let files: &[&str] = match proto.to_ascii_uppercase().as_str() {
         "UDP" => &["udp", "udp6"],
         "TCP" => &["tcp", "tcp6"],
         _ => return HashSet::new(),
     };
+    let destination = parse_ip(dst);
 
     let mut inodes = HashSet::new();
     for name in files {
@@ -167,15 +191,57 @@ fn socket_inodes(proto: &str, port: u16) -> HashSet<String> {
             let (Some(local), Some(inode)) = (fields.get(1), fields.get(9)) else {
                 continue;
             };
-            let Some((_, hex_port)) = local.rsplit_once(':') else {
+            let Some((hex_addr, hex_port)) = local.rsplit_once(':') else {
                 continue;
             };
-            if u16::from_str_radix(hex_port, 16) == Ok(port) {
+            if u16::from_str_radix(hex_port, 16) != Ok(port) {
+                continue;
+            }
+            let Some(bound) = parse_proc_addr(hex_addr) else {
+                continue;
+            };
+            if could_receive(&bound, destination) {
                 inodes.insert(format!("socket:[{inode}]"));
             }
         }
     }
     inodes
+}
+
+/// Whether a socket bound to `local` could have received a packet sent to
+/// `destination`.
+///
+/// A wildcard binding takes everything, including the v4-mapped traffic an
+/// IPv6 wildcard socket receives on a dual-stack host. Otherwise the addresses
+/// have to be the same one. An unparseable destination corroborates nothing —
+/// the safe direction, since failing to corroborate only means the alert keeps
+/// its popup.
+fn could_receive(local: &IpAddr, destination: Option<IpAddr>) -> bool {
+    if local.is_unspecified() {
+        return true;
+    }
+    destination.is_some_and(|dst| *local == dst)
+}
+
+/// Parse the hex local address /proc/net writes: a little-endian u32 per word,
+/// 8 hex characters for IPv4 and 32 for IPv6.
+fn parse_proc_addr(hex: &str) -> Option<IpAddr> {
+    match hex.len() {
+        8 => {
+            let raw = u32::from_str_radix(hex, 16).ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(raw.swap_bytes())))
+        }
+        32 => {
+            let mut octets = [0u8; 16];
+            for (word, chunk) in hex.as_bytes().chunks(8).enumerate() {
+                let text = std::str::from_utf8(chunk).ok()?;
+                let raw = u32::from_str_radix(text, 16).ok()?;
+                octets[word * 4..word * 4 + 4].copy_from_slice(&raw.swap_bytes().to_be_bytes());
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
 }
 
 /// Walk /proc for the first process with one of these sockets open.
@@ -277,25 +343,75 @@ mod tests {
     fn attribution_is_free_when_no_socket_is_bound() {
         // Port 0 can never be bound, so this exercises the early return that
         // keeps the /proc walk off the common path.
-        assert!(socket_inodes("UDP", 0).is_empty());
-        assert_eq!(asker("UDP", 0), None);
+        assert!(matching_inodes("UDP", "10.3.153.246", 0).is_empty());
+        assert_eq!(asker("UDP", "10.3.153.246", 0), None);
         // A protocol with no /proc/net file cannot produce inodes either.
-        assert!(socket_inodes("ICMP", 1900).is_empty());
+        assert!(matching_inodes("ICMP", "10.3.153.246", 1900).is_empty());
     }
 
     #[test]
     fn finds_the_process_behind_a_socket_this_test_owns() {
         use std::net::UdpSocket;
 
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        // Wildcard, which is what a real discovery client binds — and what can
+        // legitimately corroborate a packet sent to any local address.
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind an ephemeral port");
         let port = socket.local_addr().expect("local addr").port();
 
         assert!(
-            !socket_inodes("UDP", port).is_empty(),
-            "a socket this process just bound must appear in /proc/net/udp"
+            solicited_locally("UDP", "10.3.153.246", port),
+            "a wildcard socket this process just bound must corroborate"
         );
         // Whatever the harness calls the test binary, it is us, and the point
         // is that the inode resolved to a live process at all.
-        assert!(asker("UDP", port).is_some(), "should name the holding process");
+        assert!(
+            asker("UDP", "10.3.153.246", port).is_some(),
+            "should name the holding process"
+        );
+    }
+
+    #[test]
+    fn a_loopback_socket_cannot_corroborate_a_packet_from_the_lan() {
+        use std::net::UdpSocket;
+
+        // The hole an earlier version had: matching on the port alone counted
+        // this socket as proof that a packet addressed to a LAN address had
+        // been asked for. It cannot be — a loopback socket never receives LAN
+        // traffic — so a peer picking a coincidentally-occupied port would have
+        // been silenced.
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind loopback");
+        let port = socket.local_addr().expect("local addr").port();
+
+        assert!(
+            !solicited_locally("UDP", "10.3.153.246", port),
+            "a loopback binding must not corroborate LAN-addressed traffic"
+        );
+        // It does corroborate traffic actually addressed to loopback.
+        assert!(
+            solicited_locally("UDP", "127.0.0.1", port),
+            "the same socket does account for loopback-addressed traffic"
+        );
+    }
+
+    #[test]
+    fn reads_the_byte_order_proc_writes_addresses_in() {
+        assert_eq!(
+            parse_proc_addr("0100007F"),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+        );
+        assert_eq!(
+            parse_proc_addr("00000000"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        // 10.3.153.246, as the kernel writes it.
+        assert_eq!(
+            parse_proc_addr("F699030A"),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 3, 153, 246)))
+        );
+        assert_eq!(
+            parse_proc_addr("00000000000000000000000001000000"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(parse_proc_addr("nonsense"), None);
     }
 }

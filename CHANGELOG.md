@@ -47,6 +47,22 @@ All notable changes to packetminder are documented here. The format follows
 - `--replay` says so when it reports discovery replies: corroboration can only
   consult today's socket table, so historical rounds read as unsolicited more
   often than they did at the time.
+- **Corroboration matches the address, not just the port.** A socket bound to
+  `127.0.0.1` cannot receive a packet sent to a LAN address, so counting it as
+  evidence would have let a peer be silenced by picking a coincidentally
+  occupied port. Only a wildcard binding, or one on the address the packet was
+  actually sent to, corroborates.
+- **Corroborated and uncorroborated rounds no longer share a cooldown.** The
+  shared cooldown was consulted before corroboration was known, so a quiet
+  corroborated round could suppress the uncorroborated round that was supposed
+  to interrupt.
+- **Discovery classification is sticky-off.** `FlowKey` carries no source port,
+  so one reply-shaped packet could be followed by unrelated traffic to the same
+  destination port and keep the whole flow classified as discovery. Any record
+  that disagrees now disqualifies the flow permanently.
+- **A round suppressed by the cooldown no longer reports having stopped.**
+  Suppression sets the flow's alert timestamp for bookkeeping; the end-of-flow
+  log now keys on whether anything was actually announced.
 - `Alert` gained a `popup` flag, separate from urgency. Urgency ranks alerts
   that all deserve the screen; some findings are true, worth recording, and
   still not events.

@@ -175,8 +175,18 @@ being answered — the only evidence available that this host asked:
 
 | Evidence | Reported as | Popup |
 | --- | --- | --- |
-| Socket bound to the destination port | `discovery-reply`, `low` | No (default) |
-| No socket bound | `discovery-reply`, `normal`, titled *unsolicited* | **Yes** |
+| A socket bound where the packet was addressed | `discovery-reply`, `low` | No (default) |
+| No such socket | `discovery-reply`, `normal`, titled *unsolicited* | **Yes** |
+
+"Where the packet was addressed" is the operative part: the socket has to be on
+the wildcard address or on the very address the packet was sent to. Matching the
+port alone would let a socket bound to `127.0.0.1` corroborate a packet sent to a
+LAN address, which it cannot have received.
+
+Classification is also **sticky-off** across a flow's life. `FlowKey` is
+`{source, protocol, destination port}` with no source port, so one reply-shaped
+packet can be followed by unrelated traffic to the same port. The moment any
+record disagrees, the flow stops being discovery and cannot become it again.
 
 A dismissal nothing could substantiate does not earn silence, any more than an
 accusation nothing could substantiate earns a critical popup — the same rule
