@@ -51,7 +51,9 @@ const DISCOVERY_PORTS: &[(u16, &str)] = &[
     (3702, "WS-Discovery"),
     (5353, "mDNS"),
     (5355, "LLMNR"),
-    (6771, "BitTorrent local peer discovery"),
+    // BitTorrent LSD (BEP 14) is deliberately absent: it only multicasts
+    // BT-SEARCH announcements and advertises a TCP port — there is no unicast
+    // reply phase, so udp/6771 into the ephemeral range can never be one.
     (32412, "Plex GDM"),
     (32414, "Plex GDM"),
     (57621, "Spotify Connect discovery"),

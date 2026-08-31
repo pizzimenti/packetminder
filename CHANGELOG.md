@@ -14,9 +14,11 @@ All notable changes to packetminder are documented here. The format follows
   and a default-deny firewall drops it. The record that reaches the log is
   unicast, from a neighbour, addressed to this host and sustained — the exact
   signature `blocked-flow` exists to catch, meaning the opposite. Recognised
-  from the source port (SSDP, mDNS, WS-Discovery, LLMNR, NetBIOS, BitTorrent
-  LSD, Plex GDM, Spotify Connect) together with an on-link source and an
-  ephemeral destination; a flood *at* one of those ports still alerts normally.
+  from the source port (SSDP, mDNS, WS-Discovery, LLMNR, NetBIOS, Plex GDM,
+  Spotify Connect) together with an on-link source and an ephemeral
+  destination; a flood *at* one of those ports still alerts normally.
+  BitTorrent LSD is deliberately excluded — BEP 14 has no unicast reply phase,
+  so nothing from udp/6771 can be one.
 - **The alert names the local process that asked**, resolved through
   `/proc/net/udp` to `/proc/*/fd`. The device in the title answered a question;
   the program whose discovery is silently broken is never the one the address

@@ -156,7 +156,7 @@ catch, and here it is backwards: nobody is transmitting at this host.
 
 The tell is the **source** port. Each of these protocols answers *from* its own
 well-known port — 1900 SSDP, 5353 mDNS, 3702 WS-Discovery, 5355 LLMNR, 137/138
-NetBIOS, 6771 BitTorrent LSD, 32412/32414 Plex GDM, 57621 Spotify Connect — and
+NetBIOS, 32412/32414 Plex GDM, 57621 Spotify Connect — and
 the answer lands on whatever ephemeral port the query went out from. All four
 conditions are required: UDP, an on-link or private source, a listed source
 port, and a destination port inside the kernel's own ephemeral range
