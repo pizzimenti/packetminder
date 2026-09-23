@@ -4,6 +4,18 @@ All notable changes to packetminder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The enriched re-emit of an alert replaces its bare predecessor on KDE
+  Plasma instead of stacking beside it.** Replacement went through the
+  `x-canonical-private-synchronous` hint, which GNOME and dunst honour and
+  Plasma ignores, so every flow alert arrived twice: once with the bare
+  address, and again a second later with the hostname resolved. Replacement
+  now goes through the notification ID — `notify-send -p` to learn it, `-r` to
+  reuse it — which every server implementing the spec honours.
+
 ## [0.2.0] — 2026-08-30
 
 ### Added
