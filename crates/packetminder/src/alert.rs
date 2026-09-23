@@ -15,7 +15,7 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    io::Read as _,
+    io::Read,
     net::Ipv4Addr,
     process::{Command, Stdio},
     sync::{Mutex, OnceLock, mpsc::channel},
@@ -96,11 +96,27 @@ pub fn log(message: &str) {
     eprintln!("{} {}", fmt_iso_local(now_epoch()), message);
 }
 
+/// The daemon-assigned notification ID behind each dedup key.
+///
+/// Replacement goes through the ID, the one mechanism every notification
+/// server honours: `notify-send -p` prints the ID a popup was given, and
+/// `-r ID` on the next emit updates that popup instead of stacking a new one.
+/// The `x-canonical-private-synchronous` hint this used to rely on is
+/// honoured by GNOME and dunst but ignored by KDE Plasma, which is how the
+/// enriched re-emit of a flow alert stood beside its bare predecessor rather
+/// than replacing it: two popups, same finding, one with the hostname and
+/// one without.
+fn notification_ids() -> &'static Mutex<HashMap<String, u32>> {
+    static IDS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
-    // The synchronous hint makes a repeat alert replace its predecessor rather
-    // than stacking another popup on the pile.
-    let hint = format!("string:x-canonical-private-synchronous:packetminder-{}", alert.key);
     let launch = tui_command(cfg);
+    let previous = notification_ids()
+        .lock()
+        .ok()
+        .and_then(|ids| ids.get(&alert.key).copied());
 
     let mut args: Vec<String> = vec![
         "-a".into(),
@@ -109,9 +125,12 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
         alert.urgency.into(),
         "-i".into(),
         "network-wired".into(),
-        "-h".into(),
-        hint,
+        "-p".into(),
     ];
+    if let Some(id) = previous {
+        args.push("-r".into());
+        args.push(id.to_string());
+    }
     if launch.is_some() {
         args.push("-A".into());
         args.push("tui=Open packetminder".into());
@@ -125,11 +144,7 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
     // cannot stall for however long a notification sits on somebody's screen.
     let spawned = Command::new("notify-send")
         .args(&args)
-        .stdout(if launch.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn();
 
@@ -140,6 +155,24 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
             return None;
         }
     };
+
+    // `-p` prints the ID on its own line the moment the popup is up, before
+    // any `--wait`. Reading it here, on the caller's thread, is one D-Bus round
+    // trip; it has to be known before the next emit with this key, which the
+    // enrichment path can produce within a second.
+    let key = alert.key.clone();
+    let mut stdout = child.stdout.take();
+    if let Some(id) = stdout.as_mut().and_then(read_id_line)
+        && let Ok(mut ids) = notification_ids().lock()
+    {
+        // Keys are per flow and never expire on their own. A popup older than
+        // a few hundred alerts is long gone from every screen, so a stale ID
+        // is worthless and a wipe costs nothing.
+        if ids.len() >= 512 {
+            ids.clear();
+        }
+        ids.insert(key, id);
+    }
 
     Some(thread::spawn(move || {
         // Poll rather than block: `--wait` lives as long as the popup, and a
@@ -163,10 +196,10 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
         let Some(cmd) = launch else {
             return; // No button was offered; the wait was only to reap it.
         };
-        // notify-send writes at most one action name, far below the pipe
-        // buffer, so reading after exit cannot have blocked the child.
+        // After the ID, notify-send writes at most one action name, far below
+        // the pipe buffer, so reading after exit cannot have blocked the child.
         let mut pressed = String::new();
-        if let Some(mut out) = child.stdout.take() {
+        if let Some(mut out) = stdout {
             let _ = out.read_to_string(&mut pressed);
         }
         // Anything else means the popup was dismissed rather than actioned.
@@ -185,6 +218,22 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
             eprintln!("packetminder: cannot launch {program}: {e}");
         }
     }))
+}
+
+/// The first line of notify-send's stdout, parsed as the notification ID.
+///
+/// Byte-at-a-time so nothing past the newline is consumed: the rest of the
+/// stream is the action name, read later by the waiter thread.
+fn read_id_line(out: &mut impl Read) -> Option<u32> {
+    let mut line = String::new();
+    let mut byte = [0u8; 1];
+    while out.read(&mut byte).ok()? == 1 && byte[0] != b'\n' {
+        line.push(byte[0] as char);
+        if line.len() > 32 {
+            return None;
+        }
+    }
+    line.trim().parse().ok()
 }
 
 /// What the alert's button should run, or None to offer no button.
