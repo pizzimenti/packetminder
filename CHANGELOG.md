@@ -4,7 +4,7 @@ All notable changes to packetminder are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.1] — 2026-09-23
 
 ### Fixed
 
@@ -14,7 +14,9 @@ All notable changes to packetminder are documented here. The format follows
   Plasma ignores, so every flow alert arrived twice: once with the bare
   address, and again a second later with the hostname resolved. Replacement
   now goes through the notification ID — `notify-send -p` to learn it, `-r` to
-  reuse it — which every server implementing the spec honours.
+  reuse it — which every server implementing the spec honours. The hint is
+  still sent as a fallback for libnotify before 0.8.4, which reports the ID
+  too late to use when the popup carries a button.
 
 ## [0.2.0] — 2026-08-30
 
@@ -185,5 +187,7 @@ provide) to `/run/packetminder` for the unprivileged daemon to read.
 `packetminder-tui`: a live table of TCP connections with per-connection
 speeds, totals, and whois-resolved ISP names. Panic-safe terminal handling.
 
+[0.2.1]: https://github.com/pizzimenti/packetminder/releases/tag/v0.2.1
+[0.2.0]: https://github.com/pizzimenti/packetminder/releases/tag/v0.2.0
 [0.1.1]: https://github.com/pizzimenti/packetminder/releases/tag/v0.1.1
 [0.1.0]: https://github.com/pizzimenti/packetminder/releases/tag/v0.1.0
