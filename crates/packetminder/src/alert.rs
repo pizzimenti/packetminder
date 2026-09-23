@@ -101,7 +101,7 @@ pub fn log(message: &str) {
 /// Replacement goes through the ID, the one mechanism every notification
 /// server honours: `notify-send -p` prints the ID a popup was given, and
 /// `-r ID` on the next emit updates that popup instead of stacking a new one.
-/// The `x-canonical-private-synchronous` hint this used to rely on is
+/// The `x-canonical-private-synchronous` hint this used to rely on alone is
 /// honoured by GNOME and dunst but ignored by KDE Plasma, which is how the
 /// enriched re-emit of a flow alert stood beside its bare predecessor rather
 /// than replacing it: two popups, same finding, one with the hostname and
@@ -111,7 +111,18 @@ fn notification_ids() -> &'static Mutex<HashMap<String, u32>> {
     IDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// How long an emit waits for notify-send to report the popup's ID.
+///
+/// libnotify before 0.8.4 does not flush after `-p`, so with `--wait` in play
+/// the ID sits in a stdio buffer until the popup closes. The detector loop must
+/// not wait that long; past this bound the ID lands in the map whenever it
+/// arrives, and the synchronous hint covers replacement until then.
+const ID_WAIT: Duration = Duration::from_millis(500);
+
 fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
+    // Kept alongside the ID as a fallback: servers that honour the hint still
+    // replace when the ID arrives too late to pass as `-r`.
+    let hint = format!("string:x-canonical-private-synchronous:packetminder-{}", alert.key);
     let launch = tui_command(cfg);
     let previous = notification_ids()
         .lock()
@@ -125,6 +136,8 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
         alert.urgency.into(),
         "-i".into(),
         "network-wired".into(),
+        "-h".into(),
+        hint,
         "-p".into(),
     ];
     if let Some(id) = previous {
@@ -156,25 +169,28 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
         }
     };
 
-    // `-p` prints the ID on its own line the moment the popup is up, before
-    // any `--wait`. Reading it here, on the caller's thread, is one D-Bus round
-    // trip; it has to be known before the next emit with this key, which the
-    // enrichment path can produce within a second.
+    // `-p` prints the ID on its own line once the popup is up. The waiter
+    // reads it and records it; the caller waits a bounded moment so the ID is
+    // normally known before the next emit with this key, which the enrichment
+    // path can produce within a second.
     let key = alert.key.clone();
     let mut stdout = child.stdout.take();
-    if let Some(id) = stdout.as_mut().and_then(read_id_line)
-        && let Ok(mut ids) = notification_ids().lock()
-    {
-        // Keys are per flow and never expire on their own. A popup older than
-        // a few hundred alerts is long gone from every screen, so a stale ID
-        // is worthless and a wipe costs nothing.
-        if ids.len() >= 512 {
-            ids.clear();
-        }
-        ids.insert(key, id);
-    }
+    let (id_tx, id_rx) = channel();
 
-    Some(thread::spawn(move || {
+    let waiter = thread::spawn(move || {
+        if let Some(id) = stdout.as_mut().and_then(read_id_line)
+            && let Ok(mut ids) = notification_ids().lock()
+        {
+            // Keys are per flow and never expire on their own. A popup older
+            // than a few hundred alerts is long gone from every screen, so a
+            // stale ID is worthless and a wipe costs nothing.
+            if ids.len() >= 512 {
+                ids.clear();
+            }
+            ids.insert(key, id);
+        }
+        let _ = id_tx.send(());
+
         // Poll rather than block: `--wait` lives as long as the popup, and a
         // critical-urgency popup lives until somebody dismisses it. Past the
         // deadline the waiter is killed — the button goes dead, the thread and
@@ -217,7 +233,9 @@ fn notify(cfg: &Config, alert: &Alert) -> Option<thread::JoinHandle<()>> {
         {
             eprintln!("packetminder: cannot launch {program}: {e}");
         }
-    }))
+    });
+    let _ = id_rx.recv_timeout(ID_WAIT);
+    Some(waiter)
 }
 
 /// The first line of notify-send's stdout, parsed as the notification ID.
@@ -954,6 +972,19 @@ pub fn fmt_iso_local(epoch: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_line_leaves_the_action_name_unread() {
+        // The waiter reads the action name after the ID, so the ID read must
+        // stop at the newline rather than swallow the rest of the stream.
+        let mut out: &[u8] = b"42\ntui\n";
+        assert_eq!(read_id_line(&mut out), Some(42));
+        assert_eq!(out, b"tui\n");
+
+        // No ID line at all -- notify-send failed or predates `-p`.
+        assert_eq!(read_id_line(&mut &b""[..]), None);
+        assert_eq!(read_id_line(&mut &b"Unknown option -p\n"[..]), None);
+    }
 
     #[test]
     fn serial_names_are_told_apart_from_chosen_ones() {
